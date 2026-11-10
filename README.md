@@ -1,4 +1,4 @@
-# file-storage
+# Data-Plumb
 
 A production-grade **hybrid chunked content-addressed file storage microservice** in Rust.
 

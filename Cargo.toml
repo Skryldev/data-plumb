@@ -14,9 +14,7 @@ path = "src/lib.rs"
 name = "file-storage"
 path = "src/main.rs"
 
-[[bench]]
-name = "throughput"
-harness = false
+
 
 [dependencies]
 # Async runtime & HTTP
