@@ -1,0 +1,103 @@
+syntax = "proto3";
+
+package file_storage.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/your-org/file-storage/api/v1;v1";
+option java_package = "com.yourorg.filestorage.v1";
+option csharp_namespace = "YourOrg.FileStorage.V1";
+
+// Reference to one chunk inside a file. `hash` is the block-store key —
+// the plaintext BLAKE3, or BLAKE3(tenant_id || plain_hash) when the blob
+// is encrypted. `plain_hash` is the plaintext BLAKE3 used for read-back
+// verification regardless of encryption.
+message ChunkRef {
+  // Block-store key (32 bytes). Equals plain_hash unless the chunk is
+  // encrypted, in which case it is BLAKE3(tenant_id || plain_hash).
+  bytes hash = 1;
+
+  // Plaintext BLAKE3 hash of the chunk content (32 bytes).
+  bytes plain_hash = 2;
+
+  // Absolute byte offset of this chunk in the original file.
+  uint64 offset = 3;
+
+  // Chunk size in bytes BEFORE compression.
+  uint64 size_original = 4;
+
+  // Chunk size in bytes AFTER compression (and encryption, if enabled) —
+  // the size of the blob stored on disk.
+  uint64 size_stored = 5;
+
+  // True when the stored blob is zstd-compressed.
+  bool compressed = 6;
+
+  // True when the stored blob is AES-256-GCM encrypted.
+  bool encrypted = 7;
+}
+
+// Full description of how a file is reassembled from chunks. Stored in the
+// redb `files` table, keyed by file_id, and exposed verbatim by the API.
+message Manifest {
+  // UUIDv7 — time-ordered file identifier.
+  string file_id = 1;
+
+  // Owning tenant (UUID). Cannot be changed after creation.
+  string tenant_id = 2;
+
+  // Original filename (user-supplied).
+  string name = 3;
+
+  // Content type served for downloads (client-declared or
+  // application/octet-stream).
+  string mime_type = 4;
+
+  // Original file size in bytes (sum of chunk size_original values).
+  uint64 size = 5;
+
+  // Size of the stored form (sum of chunk size_stored values).
+  uint64 size_stored = 6;
+
+  // BLAKE3 hash of the complete original (plaintext) file (32 bytes).
+  bytes original_hash = 7;
+
+  // Ordered chunk list; index 0 starts at byte offset 0. May be omitted
+  // from bulk listings (use GetManifest for the full list).
+  repeated ChunkRef chunks = 8;
+
+  // Free-form tags for listing/filtering.
+  repeated string tags = 9;
+
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+
+  // Set when the file has been soft-deleted. Hard purge happens via GC.
+  google.protobuf.Timestamp deleted_at = 12;
+
+  // Monotonically increasing version, incremented on each update.
+  uint64 version = 13;
+}
+
+// A tenant record. `quota_bytes` is reserved for future use and is always
+// reported as 0 (= unlimited).
+message Tenant {
+  string id = 1;
+  string name = 2;
+  uint64 quota_bytes = 3;
+  uint64 file_count = 4;
+  uint64 used_bytes = 5;
+  google.protobuf.Timestamp created_at = 6;
+}
+
+// Empty message — used instead of google.protobuf.Empty so client
+// generators do not need the well-known-type dependency.
+message Empty {}
+
+// Pagination wrapper used by list RPCs.
+message PageRequest {
+  // Page size; server clamps to [1, 1000], default 50.
+  uint32 limit = 1;
+  // Skip count.
+  uint32 offset = 2;
+}

@@ -1,0 +1,107 @@
+syntax = "proto3";
+
+package file_storage.v1;
+
+import "file_storage/v1/common.proto";
+
+// ReplicationService is the internal protocol between storage peers.
+//
+// It is guarded by the `x-api-key` metadata (NOT a JWT) — the channel runs
+// between trusted nodes, and mTLS is recommended in production (see
+// server.grpc_tls in the configuration reference). The same operations are
+// also available over the plain-HTTP /internal/* endpoints, which the
+// built-in WAL shipper uses.
+service ReplicationService {
+  // Bidirectional batch replication. The primary streams ReplicationOp
+  // messages; the replica applies each op and acks the batch when it sees
+  // the Flush sentinel. All ops are idempotent, so replays after a crash
+  // are safe.
+  rpc ReplicateBatch(stream ReplicationOp) returns (stream ReplicationAck) {}
+
+  // Pull the raw on-disk bytes (compressed, optionally encrypted) of one
+  // chunk — used for repair and on-demand fetch.
+  rpc PullChunk(PullChunkRequest) returns (stream PullChunkResponse) {}
+
+  // Pull a manifest plus per-chunk metadata (NOT the blob bytes; pull those
+  // with PullChunk).
+  rpc PullManifest(PullManifestRequest) returns (ManifestBundle) {}
+}
+
+message ReplicationOp {
+  oneof op {
+    PutChunk put_chunk = 1;
+    PutManifest put_manifest = 2;
+    DeleteFile delete_file = 3;
+    Flush flush = 4; // sentinel — end of batch
+  }
+}
+
+message PutChunk {
+  // Block-store key (32 bytes).
+  bytes hash = 1;
+  // Plaintext BLAKE3 hash (32 bytes).
+  bytes plain_hash = 2;
+  // Raw on-disk blob: compressed and/or encrypted as produced by the
+  // upload pipeline.
+  bytes data = 3;
+  uint64 size_original = 4;
+  uint64 size_stored = 5;
+  bool compressed = 6;
+  bool encrypted = 7;
+}
+
+message PutManifest {
+  Manifest manifest = 1;
+}
+
+message DeleteFile {
+  string file_id = 1;
+  // When true the manifest is removed entirely (hard purge propagation);
+  // otherwise the replica stores the soft-delete marker.
+  bool purge = 2;
+}
+
+message Flush {}
+
+message ReplicationAck {
+  // Number of ops applied in the batch.
+  uint32 ops_acked = 1;
+  bool success = 2;
+  // Empty on success.
+  string error = 3;
+}
+
+message PullChunkRequest {
+  // Block-store key (32 bytes).
+  bytes hash = 1;
+}
+
+message PullChunkResponse {
+  oneof payload {
+    PullChunkHeader header = 1;
+    bytes data = 2;
+  }
+}
+
+message PullChunkHeader {
+  bytes hash = 1;
+  uint64 size_stored = 2;
+  bool compressed = 3;
+  bool encrypted = 4;
+}
+
+message PullManifestRequest {
+  string file_id = 1;
+}
+
+message ManifestBundle {
+  Manifest manifest = 1;
+}
+
+// Per-chunk metadata as recorded in the replica `chunks` table.
+message ChunkMeta {
+  bytes hash = 1;
+  uint64 refcount = 2;
+  uint64 blob_size = 3;
+  string on_disk_path = 4;
+}

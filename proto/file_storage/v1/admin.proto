@@ -1,0 +1,103 @@
+syntax = "proto3";
+
+package file_storage.v1;
+
+import "file_storage/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+// Administrative operations. Every RPC requires the `admin` role.
+service AdminService {
+  // Create a tenant.
+  rpc CreateTenant(CreateTenantRequest) returns (Tenant) {}
+
+  // Fetch one tenant by id.
+  rpc GetTenant(GetTenantRequest) returns (Tenant) {}
+
+  // List all tenants.
+  rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse) {}
+
+  // Trigger one garbage-collection pass (refcount or reachability mode).
+  rpc TriggerGC(TriggerGCRequest) returns (GCResult) {}
+
+  // Re-push a file (manifest + all chunk blobs) to the replication target.
+  rpc Resync(ResyncRequest) returns (ResyncResult) {}
+
+  // Query the audit trail (most recent first).
+  rpc QueryAudit(QueryAuditRequest) returns (QueryAuditResponse) {}
+}
+
+message CreateTenantRequest {
+  // Tenant name, 1..=128 characters after trim.
+  string name = 1;
+}
+
+message GetTenantRequest {
+  string id = 1;
+}
+
+message ListTenantsRequest {
+  // Max entries to return; default 100.
+  uint32 limit = 1;
+}
+
+message ListTenantsResponse {
+  repeated Tenant tenants = 1;
+  uint32 total = 2;
+}
+
+message TriggerGCRequest {
+  enum Mode {
+    // Use the mode configured for this node (retention.gc_mode).
+    MODE_UNSPECIFIED = 0;
+    // Primary mode: purge past-grace soft deletes + zero-refcount blobs.
+    REFCOUNT = 1;
+    // Replica mode: sweep blobs unreachable from any manifest.
+    REACHABILITY = 2;
+  }
+  // Defaults to the configured mode.
+  Mode mode = 1;
+  // Count what would be removed without deleting anything.
+  bool dry_run = 2;
+}
+
+message GCResult {
+  uint64 manifests_purged = 1;
+  uint64 chunks_removed = 2;
+  uint64 orphans_removed = 3;
+  uint64 bytes_reclaimed = 4;
+}
+
+message ResyncRequest {
+  string file_id = 1;
+}
+
+message ResyncResult {
+  string file_id = 1;
+  bool replicated = 2;
+}
+
+message QueryAuditRequest {
+  // Return at most this many entries (1..=1000, default 100).
+  uint32 limit = 1;
+  // Filter by tenant when set.
+  string tenant_id = 2;
+}
+
+message AuditEntry {
+  // Unique event id (UUIDv7, time-ordered).
+  string id = 1;
+  google.protobuf.Timestamp at = 2;
+  string actor = 3;
+  string tenant_id = 4;
+  // e.g. file.upload, file.delete, auth.login.success, storage.gc
+  string action = 5;
+  string object = 6;
+  string ip = 7;
+  string status = 8;
+  string detail = 9;
+}
+
+message QueryAuditResponse {
+  repeated AuditEntry entries = 1;
+  uint32 total = 2;
+}

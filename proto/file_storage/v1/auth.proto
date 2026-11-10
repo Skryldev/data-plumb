@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package file_storage.v1;
+
+import "file_storage/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+// AuthService issues and revokes credential pairs.
+//
+// Access tokens are stateless HS256 JWTs (TTL from `auth.access_ttl_secs`,
+// default 1h). Refresh tokens are opaque, server-side, rotating (TTL default
+// 7d): every Refresh call consumes the presented token and issues a new pair.
+service AuthService {
+  // Exchange username/password for an access + refresh token pair.
+  rpc Login(LoginRequest) returns (LoginResponse) {}
+
+  // Exchange a refresh token for a new access + refresh token pair.
+  // The old refresh token is revoked (single-use rotation).
+  rpc Refresh(RefreshRequest) returns (LoginResponse) {}
+
+  // Revoke a refresh token (logout). Idempotent.
+  rpc Logout(LogoutRequest) returns (Empty) {}
+}
+
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message LoginResponse {
+  // HS256 JWT. Send as `authorization: Bearer <token>` metadata.
+  string access_token = 1;
+
+  // Opaque rotating refresh token (keep secret; never log).
+  string refresh_token = 2;
+
+  // Always "Bearer".
+  string token_type = 3;
+
+  // Access-token lifetime in seconds.
+  uint64 expires_in = 4;
+
+  // Absolute expiry of the access token.
+  google.protobuf.Timestamp expires_at = 5;
+}
+
+message RefreshRequest {
+  string refresh_token = 1;
+}
+
+message LogoutRequest {
+  // Refresh token to revoke. Required: access tokens are stateless and
+  // cannot be revoked server-side; they simply expire.
+  string token = 1;
+}

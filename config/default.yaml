@@ -1,0 +1,98 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  grpc_port: 9090               # gRPC listener served alongside REST
+  grpc_tls:
+    enabled: false
+    cert_path: "/etc/file-storage/tls/server.crt"
+    key_path: "/etc/file-storage/tls/server.key"
+    client_ca_path: null        # set to enable mTLS (client certificates)
+
+storage:
+  root: "data/blocks"
+  temp_dir: "data/tmp"
+  shard_depth: 2
+
+database:
+  path: "data/index.redb"
+
+chunking:
+  min: 8192
+  avg: 32768
+  max: 131072
+
+compression:
+  level: 3
+  min_size: 1024
+
+cache:
+  l1_max_bytes: 268435456      # 256 MiB decompressed
+  l1_ttl_secs: 300
+  l2_max_bytes: 536870912      # 512 MiB compressed blobs
+  l2_ttl_secs: 3600
+  manifest_capacity: 10000
+  manifest_ttl_secs: 60
+
+auth:
+  jwt_secret: "change-me-in-production-0123456789abcdef"
+  access_ttl_secs: 900
+  refresh_ttl_secs: 604800
+  users:
+    - username: admin
+      password: "admin123"
+      tenant_id: "01930000-0000-7000-8000-000000000001"
+      role: admin
+    - username: alice
+      password: "alice123"
+      tenant_id: "01930000-0000-7000-8000-000000000002"
+      role: user
+    - username: bob
+      password: "bob123"
+      tenant_id: "01930000-0000-7000-8000-000000000003"
+      role: user
+    - username: viewer
+      password: "viewer123"
+      tenant_id: "01930000-0000-7000-8000-000000000002"
+      role: viewer
+
+encryption:
+  enabled: false
+  keys_dir: "data/keys"
+
+rate_limit:
+  enabled: true
+  per_second: 500
+  burst: 1000
+
+replication:
+  enabled: false
+  mode: async                   # sync | async
+  target_url: null              # e.g. http://replica:8080
+  upstream_url: null            # replica pulls missing chunks from here
+  api_key: "internal-dev-api-key-change-me"
+  queue_capacity: 10000
+  batch_size: 64
+  flush_interval_ms: 5000
+  sync_timeout_ms: 5000
+
+retention:
+  gc_mode: refcount             # refcount | reachability | disabled
+  grace_period_secs: 86400
+  gc_interval_secs: 300
+  orphan_min_age_secs: 3600
+
+limits:
+  max_file_size: 10737418240    # 10 GiB
+  max_body: 1073741824          # 1 GiB HTTP body cap
+
+logging:
+  format: pretty                # pretty | json
+  level: info
+
+tenants:
+  - id: "01930000-0000-7000-8000-000000000001"
+    name: "default"
+  - id: "01930000-0000-7000-8000-000000000002"
+    name: "acme"
+  - id: "01930000-0000-7000-8000-000000000003"
+    name: "globex"

@@ -1,0 +1,89 @@
+# Production configuration template.
+# Secrets below MUST be replaced before rollout:
+#   * auth.jwt_secret            -> openssl rand -hex 32
+#   * auth.users[].password_hash -> file-storage hash-password --password '...'
+#   * replication.api_key        -> openssl rand -hex 24
+server:
+  host: "0.0.0.0"
+  port: 8080
+  grpc_port: 9090
+  grpc_tls:
+    enabled: true               # terminate TLS at the gRPC listener
+    cert_path: "/etc/file-storage/tls/server.crt"
+    key_path: "/etc/file-storage/tls/server.key"
+    client_ca_path: "/etc/file-storage/tls/client-ca.crt"   # mTLS for peers
+
+storage:
+  root: "/var/lib/file-storage/data/blocks"
+  temp_dir: "/var/lib/file-storage/data/tmp"
+  shard_depth: 2
+
+database:
+  path: "/var/lib/file-storage/data/index.redb"
+
+chunking:
+  min: 8192
+  avg: 32768
+  max: 131072
+
+compression:
+  level: 3
+  min_size: 1024
+
+cache:
+  l1_max_bytes: 268435456
+  l1_ttl_secs: 300
+  l2_max_bytes: 536870912
+  l2_ttl_secs: 3600
+  manifest_capacity: 10000
+  manifest_ttl_secs: 60
+
+auth:
+  jwt_secret: "REPLACE_WITH_OPENSSL_RAND_HEX_32"
+  access_ttl_secs: 900
+  refresh_ttl_secs: 604800
+  users:
+    - username: admin
+      # EXAMPLE hash for password "admin123" — generate your own:
+      #   file-storage hash-password --password '...'
+      password_hash: "$argon2id$v=19$m=65536,t=3,p=4$PNC2X4b4TRThXaKxV1id3g$THcRSGJEG3WkoeVMhCSws4ueB/TTEDPxcE47st/L/1g"
+      tenant_id: "01930000-0000-7000-8000-000000000001"
+      role: admin
+
+encryption:
+  enabled: true
+  keys_dir: "/var/lib/file-storage/data/keys"
+
+rate_limit:
+  enabled: true
+  per_second: 1000
+  burst: 2000
+
+replication:
+  enabled: true
+  mode: async
+  target_url: "http://replica:8080"
+  upstream_url: null
+  api_key: "REPLACE_WITH_CLUSTER_API_KEY"
+  queue_capacity: 50000
+  batch_size: 64
+  flush_interval_ms: 5000
+  sync_timeout_ms: 5000
+
+retention:
+  gc_mode: refcount
+  grace_period_secs: 86400
+  gc_interval_secs: 300
+  orphan_min_age_secs: 3600
+
+limits:
+  max_file_size: 10737418240
+  max_body: 1073741824
+
+logging:
+  format: json
+  level: info
+
+tenants:
+  - id: "01930000-0000-7000-8000-000000000001"
+    name: "default"

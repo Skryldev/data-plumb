@@ -1,0 +1,73 @@
+services:
+  primary:
+    build: .
+    image: file-storage:1.0.0
+    container_name: fs-primary
+    ports:
+      - "8080:8080"   # REST
+      - "9090:9090"   # gRPC
+    environment:
+      FS_SERVER__PORT: "8080"
+      FS_SERVER__GRPC_PORT: "9090"
+      FS_STORAGE__ROOT: "/var/lib/file-storage/data/blocks"
+      FS_DATABASE__PATH: "/var/lib/file-storage/data/index.redb"
+      FS_ENCRYPTION__KEYS_DIR: "/var/lib/file-storage/data/keys"
+      FS_REPLICATION__ENABLED: "true"
+      FS_REPLICATION__MODE: "async"
+      FS_REPLICATION__TARGET_URL: "http://replica:8080"
+      FS_REPLICATION__API_KEY: "cluster-api-key-change-me"
+      FS_LOGGING__FORMAT: "json"
+      RUST_LOG: "info"
+    volumes:
+      - fs_primary:/var/lib/file-storage/data
+    restart: unless-stopped
+
+  replica:
+    image: file-storage:1.0.0
+    container_name: fs-replica
+    depends_on:
+      - primary
+    ports:
+      - "8081:8080"   # REST
+      - "9091:9090"   # gRPC
+    environment:
+      FS_SERVER__PORT: "8080"
+      FS_SERVER__GRPC_PORT: "9090"
+      FS_STORAGE__ROOT: "/var/lib/file-storage/data/blocks"
+      FS_DATABASE__PATH: "/var/lib/file-storage/data/index.redb"
+      FS_ENCRYPTION__KEYS_DIR: "/var/lib/file-storage/data/keys"
+      FS_REPLICATION__ENABLED: "false"
+      FS_REPLICATION__UPSTREAM_URL: "http://primary:8080"
+      FS_REPLICATION__API_KEY: "cluster-api-key-change-me"
+      FS_RETENTION__GC_MODE: "reachability"
+      FS_LOGGING__FORMAT: "json"
+      RUST_LOG: "info"
+    volumes:
+      - fs_replica:/var/lib/file-storage/data
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: fs-prometheus
+    depends_on:
+      - primary
+      - replica
+    ports:
+      - "9099:9090"   # host 9090 belongs to the gRPC listeners
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    restart: unless-stopped
+
+  # One-shot service discovery check (run: docker compose run --rm grpcurl).
+  grpcurl:
+    image: fullstorydev/grpcurl:v1.9.1
+    profiles: ["grpc-test"]
+    entrypoint: ["/grpcurl"]
+    command: ["-plaintext", "-max-time", "5", "primary:9090", "list"]
+    depends_on:
+      - primary
+    restart: "no"
+
+volumes:
+  fs_primary:
+  fs_replica:

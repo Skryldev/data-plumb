@@ -1,0 +1,164 @@
+syntax = "proto3";
+
+package file_storage.v1;
+
+import "file_storage/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+// FileService exposes the core file operations.
+//
+// Streaming semantics:
+//   * Upload is client-streaming: the client sends one UploadChunk with the
+//     `header` oneof set, followed by any number of UploadChunk messages with
+//     `data` set. The server responds with a single UploadResponse when the
+//     stream completes. The server performs content-defined chunking
+//     internally — the client does NOT chunk content itself.
+//   * Download is server-streaming: the server sends one DownloadChunk with
+//     `header` set, followed by DownloadChunk messages with `data` set, in
+//     order and without gaps.
+//
+// Backpressure: tonic uses HTTP/2 flow control; clients should not buffer
+// unbounded data and should honor READY signals.
+service FileService {
+  // Upload a file. The first message MUST carry the header.
+  rpc Upload(stream UploadChunk) returns (UploadResponse) {}
+
+  // Download a file (full or partial). The first message is always a
+  // DownloadHeader; subsequent messages carry file bytes.
+  rpc Download(DownloadRequest) returns (stream DownloadChunk) {}
+
+  // Retrieve a manifest without downloading file content.
+  rpc GetManifest(GetManifestRequest) returns (Manifest) {}
+
+  // List files for the caller's tenant.
+  rpc ListFiles(ListFilesRequest) returns (ListFilesResponse) {}
+
+  // Delete a file (soft delete by default; admin can hard-purge).
+  rpc DeleteFile(DeleteFileRequest) returns (DeleteFileResponse) {}
+}
+
+message UploadChunk {
+  oneof payload {
+    // Exactly the first message of the stream.
+    UploadHeader header = 1;
+    // Raw file bytes, any size (1 MiB pieces recommended).
+    bytes data = 2;
+  }
+}
+
+message UploadHeader {
+  // Original filename. Required, 1..=255 bytes after trim.
+  string name = 1;
+
+  // Optional content-type hint. Served verbatim on download.
+  string mime_type = 2;
+
+  // Optional size guard: when set and the stream exceeds this many bytes,
+  // the upload is rejected with RESOURCE_EXHAUSTED.
+  uint64 expected_size = 3;
+
+  // Optional tenant override; only honoured for admins. Defaults to the
+  // caller's tenant from the access token.
+  string tenant_id = 4;
+
+  // Free-form tags (deduplicated server-side).
+  repeated string tags = 5;
+}
+
+message UploadResponse {
+  // Manifest of the stored file.
+  Manifest manifest = 1;
+
+  // Bytes NOT written because identical chunks already existed (dedup).
+  uint64 deduped_bytes = 2;
+
+  // Bytes actually written to disk (after compression + encryption).
+  uint64 stored_bytes = 3;
+
+  // Number of chunks that were dedup hits.
+  uint32 dedup_chunks = 4;
+
+  // size / stored_bytes; 1.0 when nothing was stored (empty file).
+  double compression_ratio = 5;
+}
+
+message DownloadRequest {
+  // File identifier (UUID).
+  string file_id = 1;
+
+  // Range request. Both fields optional; `start` inclusive, `end` EXCLUSIVE
+  // (Rust slice semantics). Unset both → whole file. `start` only → to EOF.
+  // `end` only → first `end` bytes. Range beyond EOF is clamped; a `start`
+  // at or beyond the file size fails with OUT_OF_RANGE.
+  optional uint64 start = 2;
+  optional uint64 end = 3;
+}
+
+message DownloadChunk {
+  oneof payload {
+    // Exactly the first message of the stream.
+    DownloadHeader header = 1;
+    // Ordered plaintext bytes of the requested range.
+    bytes data = 2;
+  }
+}
+
+message DownloadHeader {
+  string file_id = 1;
+
+  // Size of the response payload (may be < total_size for ranges).
+  uint64 size = 2;
+
+  // Size of the full original file.
+  uint64 total_size = 3;
+
+  // Content type of the file.
+  string mime_type = 4;
+
+  // BLAKE3 of the full original file — clients can verify the assembled
+  // bytes themselves (32 bytes).
+  bytes original_hash = 5;
+
+  // Actual start of this response (inclusive).
+  uint64 start = 6;
+
+  // Actual end of this response (exclusive).
+  uint64 end = 7;
+}
+
+message GetManifestRequest {
+  string file_id = 1;
+  // Include the (possibly large) chunk list; default false.
+  bool include_chunks = 2;
+}
+
+message ListFilesRequest {
+  // Page size; server clamps to [1, 1000], default 50.
+  uint32 limit = 1;
+  uint32 offset = 2;
+  // Exact tag match when set.
+  string tag = 3;
+  // Substring name match when set.
+  string name = 4;
+  // Include soft-deleted files; admins only.
+  bool include_deleted = 5;
+}
+
+message ListFilesResponse {
+  // Summaries without chunk lists (use GetManifest for chunks).
+  repeated Manifest files = 1;
+  uint32 total = 2;
+}
+
+message DeleteFileRequest {
+  string file_id = 1;
+  // Hard-purge instead of soft delete; requires admin role.
+  bool purge = 2;
+}
+
+message DeleteFileResponse {
+  // Deletion timestamp; unset when the file was already gone.
+  google.protobuf.Timestamp deleted_at = 1;
+  // True when a hard purge was performed.
+  bool purged = 2;
+}
