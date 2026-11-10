@@ -1,7 +1,6 @@
 services:
   primary:
-    build: .
-    image: file-storage:1.0.0
+    image: skryldev/data-plumb:1.2.1
     container_name: fs-primary
     ports:
       - "8080:8080"   # REST
@@ -23,7 +22,7 @@ services:
     restart: unless-stopped
 
   replica:
-    image: file-storage:1.0.0
+    image: skryldev/data-plumb:1.2.1
     container_name: fs-replica
     depends_on:
       - primary
@@ -58,7 +57,6 @@ services:
       - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     restart: unless-stopped
 
-  # One-shot service discovery check (run: docker compose run --rm grpcurl).
   grpcurl:
     image: fullstorydev/grpcurl:v1.9.1
     profiles: ["grpc-test"]

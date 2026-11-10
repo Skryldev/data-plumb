@@ -2,7 +2,7 @@
 # Stage 1: chef base
 # cargo-chef + Rust toolchain + minimal system deps
 # =============================================================
-FROM lukemathwalker/cargo-chef:latest-rust-1.99-slim-trixie AS chef
+FROM lukemathwalker/cargo-chef:latest-rust-1.99.1-bookworm AS chef
 WORKDIR /src
 
 # System deps needed by build.rs / linking.
@@ -18,7 +18,6 @@ RUN apt-get update \
 FROM chef AS planner
 
 # Copy everything referenced by Cargo.toml so cargo-chef can parse the manifest.
-# NOTE: benches/ was removed from Cargo.toml, so it's not needed here.
 COPY Cargo.toml Cargo.lock* build.rs ./
 COPY proto ./proto
 COPY src ./src
@@ -41,6 +40,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 COPY Cargo.toml Cargo.lock* build.rs ./
 COPY proto ./proto
 COPY src ./src
+COPY config ./config
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -61,7 +61,7 @@ LABEL org.opencontainers.image.title="file-storage" \
 # Binary already built; copy only what's needed at runtime.
 COPY --from=builder /usr/local/bin/file-storage /usr/local/bin/file-storage
 
-# Config — make sure ./config exists in the build context.
+# Config files (default.yaml, production.yaml, prometheus.yml)
 COPY --from=builder /src/config /etc/file-storage
 
 ENV RUST_LOG=info \
