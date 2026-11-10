@@ -2,6 +2,7 @@ services:
   primary:
     image: skryldev/data-plumb:1.2.1
     container_name: fs-primary
+    user: "0:0"
     ports:
       - "8080:8080"   # REST
       - "9090:9090"   # gRPC
@@ -24,6 +25,7 @@ services:
   replica:
     image: skryldev/data-plumb:1.2.1
     container_name: fs-replica
+    user: "0:0"
     depends_on:
       - primary
     ports:
@@ -60,7 +62,7 @@ services:
   grpcurl:
     image: fullstorydev/grpcurl:v1.9.1
     profiles: ["grpc-test"]
-    entrypoint: ["/grpcurl"]
+    entrypoint: ["/bin/grpcurl"]
     command: ["-plaintext", "-max-time", "5", "primary:9090", "list"]
     depends_on:
       - primary
