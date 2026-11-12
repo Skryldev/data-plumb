@@ -1,8 +1,12 @@
 # Production configuration template.
-# Secrets below MUST be replaced before rollout:
-#   * auth.jwt_secret            -> openssl rand -hex 32
-#   * auth.users[].password_hash -> file-storage hash-password --password '...'
-#   * replication.api_key        -> openssl rand -hex 24
+#
+# C-01: this template contains NO working credentials — booting it as-is
+# FAILS by design. Provision real secrets first (see
+# docs/src/operations/bootstrap.md):
+#   openssl rand -hex 32          # auth.jwt_secret
+#   openssl rand -hex 24          # replication.api_key
+#   file-storage hash-password    # argon2id PHC string per user
+# Secrets below MUST be replaced before rollout.
 server:
   host: "0.0.0.0"
   port: 8080
@@ -39,33 +43,36 @@ cache:
   manifest_ttl_secs: 60
 
 auth:
+  # C-01: replace with operator-generated secret (openssl rand -hex 32).
   jwt_secret: "REPLACE_WITH_OPENSSL_RAND_HEX_32"
   access_ttl_secs: 900
   refresh_ttl_secs: 604800
   users:
     - username: admin
-      # EXAMPLE hash for password "admin123" — generate your own:
-      #   file-storage hash-password --password '...'
-      password_hash: "$argon2id$v=19$m=65536,t=3,p=4$PNC2X4b4TRThXaKxV1id3g$THcRSGJEG3WkoeVMhCSws4ueB/TTEDPxcE47st/L/1g"
       tenant_id: "01930000-0000-7000-8000-000000000001"
       role: admin
+      # C-01: argon2id PHC ONLY in production (plaintext `password` is
+      # rejected by validation in release builds).
+      #   file-storage hash-password   # reads the password from stdin
+      password_hash: "REPLACE_WITH_FILE_STORAGE_HASH_PASSWORD_OUTPUT"
 
 encryption:
-  enabled: true
+  enabled: false
   keys_dir: "/var/lib/file-storage/data/keys"
 
 rate_limit:
   enabled: true
-  per_second: 1000
-  burst: 2000
+  per_second: 500
+  burst: 1000
 
 replication:
-  enabled: true
+  enabled: false
   mode: async
-  target_url: "http://replica:8080"
+  target_url: null
   upstream_url: null
-  api_key: "REPLACE_WITH_CLUSTER_API_KEY"
-  queue_capacity: 50000
+  # C-01: per-node secret (openssl rand -hex 24); never ship a known value.
+  api_key: "REPLACE_WITH_OPENSSL_RAND_HEX_24"
+  queue_capacity: 10000
   batch_size: 64
   flush_interval_ms: 5000
   sync_timeout_ms: 5000

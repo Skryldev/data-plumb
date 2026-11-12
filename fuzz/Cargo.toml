@@ -1,0 +1,23 @@
+[package]
+name = "file-storage-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+# CI-W4: libFuzzer targets are run OUT-OF-BAND via `cargo +nightly fuzz`
+# against the release box (I-04 follow-up); this skeleton is NOT part of
+# the default `cargo test` workspace on purpose.
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.file-storage]
+path = ".."
+
+[[bin]]
+name = "validate_upload"
+path = "fuzz_targets/validate_upload.rs"
+test = false
+doc = false
+bench = false

@@ -32,6 +32,9 @@ pub enum AuditAction {
     Purge,
     LoginSuccess,
     LoginFailure,
+    /// M-05: a login was refused by the per-username lockout BEFORE the
+    /// password verify ran.
+    LoginThrottled,
     TenantCreate,
     ReplicationApply,
     GcRun,
@@ -51,6 +54,7 @@ impl AuditAction {
             AuditAction::ReplicationApply => "replication.apply",
             AuditAction::GcRun => "storage.gc",
             AuditAction::Resync => "replication.resync",
+            AuditAction::LoginThrottled => "auth.login.throttled",
         }
     }
 }

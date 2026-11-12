@@ -1,27 +1,30 @@
-//! Per-tenant token-bucket rate limiting for unary RPCs.
+//! Per-tenant token-bucket rate limiting for unary AND streaming RPCs.
 //!
-//! Interceptors cannot be async, so the limiter is a plain `Mutex` map of
-//! token buckets keyed by tenant id. The bucket refills linearly
-//! (`per_second` tokens/s) up to `burst`. Disabled configs pass through.
-//! Streaming RPCs do not pass through interceptors and are therefore not
-//! rate-limited here (documented; the REST path keeps its governor).
+//! M-05: ONE governor instance lives in `AppState` (`state.0.rate_limiter`);
+//! the unary interceptor and the streaming handlers (Upload/Download) all
+//! take tokens from that same instance — the streaming bypass is closed.
+//! The bucket map uses the shared bounded-map helper: entries evict
+//! individually (oldest first), never wholesale (the pre-M-05 `clear()`
+//! was the I-06 bug pattern).
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use uuid::Uuid;
 
-/// Buckets are pruned when the map grows beyond this many tenants.
+use crate::core::bounded_map::BoundedMap;
+
+/// Buckets are evicted individually (oldest first) when the map grows
+/// beyond this many tenants — never a wholesale clear.
 const MAX_TRACKED_TENANTS: usize = 10_000;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Bucket {
     tokens: f64,
     last_refill: Instant,
 }
 
-/// Rate limiter shared by the unary auth interceptor.
+/// Rate limiter shared by the unary interceptor and streaming handlers.
 #[derive(Clone)]
 pub struct RateLimiter {
     inner: Arc<Inner>,
@@ -31,7 +34,7 @@ struct Inner {
     enabled: bool,
     per_second: f64,
     burst: f64,
-    buckets: Mutex<HashMap<Uuid, Bucket>>,
+    buckets: Mutex<BoundedMap<Uuid, Bucket>>,
 }
 
 impl RateLimiter {
@@ -41,7 +44,7 @@ impl RateLimiter {
                 enabled,
                 per_second: per_second.max(1) as f64,
                 burst: burst.max(1) as f64,
-                buckets: Mutex::new(HashMap::new()),
+                buckets: Mutex::new(BoundedMap::new(MAX_TRACKED_TENANTS)),
             }),
         }
     }
@@ -52,31 +55,39 @@ impl RateLimiter {
             return true;
         }
         let now = Instant::now();
-        let mut buckets = self
+        let mut map = self
             .inner
             .buckets
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if buckets.len() > MAX_TRACKED_TENANTS {
-            buckets.clear();
-        }
-        let bucket = buckets
-            .entry(tenant)
-            .and_modify(|b| {
-                let elapsed = now.duration_since(b.last_refill).as_secs_f64();
-                b.tokens = (b.tokens + elapsed * self.inner.per_second).min(self.inner.burst);
-                b.last_refill = now;
-            })
-            .or_insert_with(|| Bucket {
-                tokens: self.inner.burst,
+        let allowed;
+        if let Some(b) = map.get_mut(&tenant) {
+            let elapsed = now.duration_since(b.last_refill).as_secs_f64();
+            b.tokens = (b.tokens + elapsed * self.inner.per_second).min(self.inner.burst);
+            b.last_refill = now;
+            allowed = b.tokens >= 1.0;
+            if allowed {
+                b.tokens -= 1.0;
+            }
+        } else {
+            // Fresh bucket starts at `burst` (>= 1 by from_cfg) and THIS
+            // request consumes its first token. get_or_insert performs the
+            // oldest-first eviction beyond the shared helper's cap (I-06
+            // fix: never a wholesale clear).
+            let initial = self.inner.burst - 1.0;
+            map.get_or_insert(tenant, || Bucket {
+                tokens: initial,
                 last_refill: now,
             });
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            true
-        } else {
-            false
+            allowed = true; // burst >= 1 ⇒ at least this token existed
         }
+        allowed
+    }
+
+    /// Stable identity of the shared governor instance — gate tests assert
+    /// the interceptor and streaming handlers resolve to the SAME instance.
+    pub fn instance_ptr(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
     }
 }
 

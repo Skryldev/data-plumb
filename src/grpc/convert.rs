@@ -70,7 +70,28 @@ pub fn manifest_to_proto(m: &InternalManifest, include_chunks: bool) -> pb::Mani
         updated_at: Some(ts_from_ms(m.updated_at_ms)),
         deleted_at: m.deleted_at_ms.map(ts_from_ms),
         version: m.version,
+        // M-04c: full-fidelity conversion. Only the read-side helper
+        // `manifest_to_proto_capped` ever sets the truncation flag.
+        chunks_truncated: false,
     }
+}
+
+/// M-04c: read-side manifest conversion with a hard cap on the chunk list.
+/// A hostile/oversized manifest (100k chunks) must not OOM the handler that
+/// serializes it; the cap matches the REST meta endpoint (`MAX_LISTED_CHUNKS`).
+/// Replication and upload responses use the full-fidelity
+/// [`manifest_to_proto`] so no data is ever lost on the wire that needs it.
+pub fn manifest_to_proto_capped(
+    m: &InternalManifest,
+    include_chunks: bool,
+    cap: usize,
+) -> pb::Manifest {
+    let mut proto = manifest_to_proto(m, include_chunks);
+    if include_chunks && proto.chunks.len() > cap {
+        proto.chunks.truncate(cap);
+        proto.chunks_truncated = true;
+    }
+    proto
 }
 
 /// Rebuilds an internal manifest from its protobuf form. Used by the

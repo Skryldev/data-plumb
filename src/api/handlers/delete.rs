@@ -90,10 +90,9 @@ pub async fn hard_purge(state: &AppState, manifest: &Manifest) -> Result<(), Sto
     let hashes: Vec<[u8; 32]> = manifest.chunks.iter().map(|c| c.hash).collect();
     state.0.index.remove_manifest(&manifest.file_id).await?;
     state.0.cache.manifests.invalidate(&manifest.file_id).await;
-    let zeroed = state.0.index.decr_refcounts(&hashes).await?;
-    for h in &zeroed {
-        state.0.blocks.delete(h).await?;
-    }
+    // C-03: route through the GC sweep helper so the safe ordering
+    // (re-check -> unlink -> finalize) applies to request-path purges too.
+    state.0.gc.purge_chunks_now(hashes).await?;
     state.0.replicator.enqueue_purge(manifest.file_id).await?;
     Ok(())
 }

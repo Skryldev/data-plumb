@@ -174,6 +174,15 @@ pub async fn internal_apply_file(
 // -- apply helpers -----------------------------------------------------------
 
 async fn apply_chunk(state: &AppState, p: ChunkPayload) -> Result<(), StorageError> {
+    // H-04: peer-supplied metadata must agree with the actual bytes before
+    // anything is persisted; a mismatch is corruption from the peer.
+    if p.size_stored != p.blob.len() as u64 {
+        return Err(StorageError::Corruption(format!(
+            "apply_chunk: peer size_stored {} != blob len {}",
+            p.size_stored,
+            p.blob.len()
+        )));
+    }
     let path = state.0.blocks.relative_path(&p.hash);
     // Idempotent atomic write (exists -> no-op), then metadata-only-if-absent.
     state.0.blocks.write(&p.hash, &p.blob).await?;

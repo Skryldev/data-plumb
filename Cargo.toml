@@ -14,7 +14,41 @@ path = "src/lib.rs"
 name = "file-storage"
 path = "src/main.rs"
 
+[[test]]
+name = "regression_race_gc"
+path = "tests/regression/race_gc.rs"
 
+[[test]]
+name = "regression_replica_purge"
+path = "tests/regression/replica_purge.rs"
+
+[[test]]
+name = "regression_hardening"
+path = "tests/regression/hardening.rs"
+
+[[test]]
+name = "regression_m04_validation"
+path = "tests/regression/m04_validation.rs"
+
+[[test]]
+name = "regression_m07_repair_verify"
+path = "tests/regression/m07_repair_verify.rs"
+
+[[test]]
+name = "regression_m05_throttle"
+path = "tests/regression/m05_throttle.rs"
+
+[[test]]
+name = "regression_m01_reconcile"
+path = "tests/regression/m01_reconcile.rs"
+
+[[test]]
+name = "property_validation"
+path = "tests/property/validation.rs"
+
+[[bench]]
+name = "throughput"
+harness = false
 
 [dependencies]
 # Async runtime & HTTP
@@ -40,7 +74,7 @@ rmp-serde = "1.3"
 config = { version = "0.14", features = ["yaml"] }
 
 # Caching
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12", features = ["future", "sync"] }
 
 # Security
 jsonwebtoken = "9.3"
@@ -105,6 +139,7 @@ futures = "0.3"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart"] }
 rcgen = "0.13"
+proptest = "1.8.0"
 
 [profile.release]
 opt-level = 3

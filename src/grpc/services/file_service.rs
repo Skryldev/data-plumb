@@ -9,8 +9,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::api::middleware::tenant::check_file_access;
+use crate::core::validation::{self, validate_upload, UploadRequestView};
 use crate::error::StorageError;
-use crate::grpc::convert::{manifest_to_proto, ts_from_ms, uuid_from_str};
+use crate::grpc::convert::{
+    manifest_to_proto, manifest_to_proto_capped, ts_from_ms, uuid_from_str,
+};
 use crate::grpc::generated::pb;
 use crate::grpc::generated::FileService;
 use crate::grpc::proto_auth::{context_of, request_id_of, status_from_error};
@@ -54,6 +57,11 @@ impl FileService for FileServiceImpl {
     ) -> Result<Response<pb::UploadResponse>, Status> {
         let ctx = context_of(&self.state, &request)?;
         ctx.require_write().map_err(|e| status_from_error(&e))?;
+        // M-05: streaming parity — the SAME tenant governor the unary
+        // interceptor uses, at handler entry, BEFORE any pipeline work.
+        if !self.state.0.rate_limiter.allow(ctx.tenant_id) {
+            return Err(Status::resource_exhausted("tenant rate limit exceeded"));
+        }
         let request_id = request_id_of(&request);
         let mut inbound = request.into_inner();
 
@@ -72,11 +80,34 @@ impl FileService for FileServiceImpl {
         };
 
         let name = header.name.trim();
-        if name.is_empty() || name.len() > 255 {
-            return Err(Status::invalid_argument(
-                "name must be 1..=255 bytes after trim",
-            ));
+        let mime = if header.mime_type.trim().is_empty() {
+            "application/octet-stream".to_string()
+        } else {
+            header.mime_type.trim().to_string()
+        };
+        let mut tags: Vec<String> = Vec::new();
+        for t in header.tags {
+            let t = t.trim().to_string();
+            if !t.is_empty() && !tags.contains(&t) {
+                tags.push(t);
+            }
         }
+        let expected = (header.expected_size > 0).then_some(header.expected_size);
+
+        // M-04: the shared validation layer — the ONLY place request-shape
+        // rules live (name/tag/mime caps, expected_size cap). Runs BEFORE
+        // admission control so a malformed header is a clean
+        // INVALID_ARGUMENT, never a budget RESOURCE_EXHAUSTED.
+        let view = UploadRequestView {
+            tenant: ctx.tenant_id,
+            name,
+            mime: &mime,
+            tags: &tags,
+            expected_size: expected,
+            include_deleted: false,
+            role: ctx.role,
+        };
+        validate_upload(&view, &self.state.0.cfg.limits).map_err(|e| status_from_error(&e))?;
         let name = name.to_string();
 
         // 2. Tenant selection: callers stay in their own tenant; admins may
@@ -98,24 +129,31 @@ impl FileService for FileServiceImpl {
             requested
         };
 
-        let mime = if header.mime_type.trim().is_empty() {
-            "application/octet-stream".to_string()
-        } else {
-            header.mime_type.trim().to_string()
+        // H-01: the same admission control REST has. Known expected_size is
+        // admitted/rejected before streaming; unknown sizes charge as they
+        // stream and abort at the budget line (RESOURCE_EXHAUSTED).
+        let lease = match expected {
+            Some(exp) => self
+                .state
+                .0
+                .upload_gate
+                .try_reserve_known(exp)
+                .map_err(gate_status)?,
+            None => self
+                .state
+                .0
+                .upload_gate
+                .try_reserve_unknown()
+                .map_err(gate_status)?,
         };
-        let mut tags: Vec<String> = Vec::new();
-        for t in header.tags {
-            let t = t.trim().to_string();
-            if !t.is_empty() && !tags.contains(&t) {
-                tags.push(t);
-            }
-        }
-        let expected = (header.expected_size > 0).then_some(header.expected_size);
 
         // 3. Bridge the gRPC stream into the pipeline input stream. The
         //    bridge enforces expected_size and the global size cap so the
         //    server never buffers an unbounded body.
         let max_size = self.state.0.cfg.limits.max_file_size;
+        // The lease moves into the stream bridge: it is released when the
+        // stream ends — success, error, client abort, or panic (Drop).
+        let lease = std::sync::Mutex::new(Some(lease));
         let input = async_stream::try_stream! {
             let mut seen: u64 = 0;
             while let Some(msg) = inbound.message().await.map_err(|e| {
@@ -124,6 +162,27 @@ impl FileService for FileServiceImpl {
                 match msg.payload {
                     Some(pb::upload_chunk::Payload::Data(data)) => {
                         seen += data.len() as u64;
+                        // Take-charge-put: the mutex guard is dropped
+                        // before any await point (std Mutex is not Send).
+                        let charge_result = {
+                            let mut guard = lease.lock().expect("lease mutex");
+                            match guard.take() {
+                                Some(mut l) => {
+                                    let r = l.charge(data.len() as u64);
+                                    *guard = Some(l);
+                                    r
+                                }
+                                None => Ok(()),
+                            }
+                        };
+                        charge_result.map_err(|_| {
+                            // Stream error type is StorageError; the
+                            // transport mapping happens at the boundary.
+                            StorageError::TooLarge(
+                                "upload byte budget exhausted (H-01 admission control)"
+                                    .to_string(),
+                            )
+                        })?;
                         if seen > max_size {
                             Err(StorageError::TooLarge(format!(
                                 "stream exceeded the {max_size}-byte limit"
@@ -190,6 +249,10 @@ impl FileService for FileServiceImpl {
         request: Request<pb::DownloadRequest>,
     ) -> Result<Response<DownloadStream>, Status> {
         let ctx = context_of(&self.state, &request)?;
+        // M-05: streaming parity (see `upload`) — same shared governor.
+        if !self.state.0.rate_limiter.allow(ctx.tenant_id) {
+            return Err(Status::resource_exhausted("tenant rate limit exceeded"));
+        }
         let req = request.into_inner();
         let file_id = uuid_from_str(&req.file_id, "file_id").map_err(|e| status_from_error(&e))?;
 
@@ -308,9 +371,14 @@ impl FileService for FileServiceImpl {
             .await
             .map_err(|e| status_from_error(&e))?;
         check_file_access(&ctx, &manifest.tenant_id).map_err(|e| status_from_error(&e))?;
-        Ok(Response::new(manifest_to_proto(
+        // M-04c: hostile/oversized manifests cannot OOM the handler — the
+        // chunk list is capped at the same constant the REST meta endpoint
+        // uses, with the additive `chunks_truncated` flag telling clients
+        // the list was cut. Replication paths stay uncapped.
+        Ok(Response::new(manifest_to_proto_capped(
             &manifest,
             req.include_chunks,
+            validation::MAX_LISTED_CHUNKS,
         )))
     }
 
@@ -328,35 +396,31 @@ impl FileService for FileServiceImpl {
             (req.limit as usize).clamp(1, 1000)
         };
         let offset = req.offset as usize;
-        let include_deleted = req.include_deleted && ctx.role.is_admin();
+        // M-04a: parity with REST — viewers asking for deleted files get an
+        // explicit PERMISSION_DENIED, not a silently coerced filter.
+        if req.include_deleted {
+            validation::ensure_can_list_deleted(ctx.role).map_err(|e| status_from_error(&e))?;
+        }
+        let include_deleted = req.include_deleted;
 
-        let index = &self.state.0.index;
-        let tag = non_empty(&req.tag);
-        let name = non_empty(&req.name);
+        // M-04d: THE shared list/count implementation (same code REST calls),
+        // so `total` cannot diverge between transports.
+        let (manifests, total) = self
+            .state
+            .0
+            .index
+            .list_filtered(
+                &ctx.tenant_id,
+                Some(req.tag.as_str()),
+                Some(req.name.as_str()),
+                include_deleted,
+                limit,
+                offset,
+            )
+            .await
+            .map_err(|e| status_from_error(&e))?;
+        let total = total.min(u32::MAX as u64) as u32;
 
-        let manifests: Vec<Manifest> = if let Some(tag) = tag {
-            let ids = index.list_ids_by_tag(&ctx.tenant_id, tag).await?;
-            let mut out = Vec::new();
-            for id in ids {
-                if let Some(m) = index.get_manifest(&id).await? {
-                    if include_deleted || !m.is_deleted() {
-                        out.push(m);
-                    }
-                }
-            }
-            out
-        } else if let Some(name) = name {
-            match index.get_by_name(&ctx.tenant_id, name).await? {
-                Some(m) if include_deleted || !m.is_deleted() => vec![m],
-                _ => Vec::new(),
-            }
-        } else {
-            index
-                .list_by_tenant(&ctx.tenant_id, include_deleted, limit, offset)
-                .await?
-        };
-
-        let total = manifests.len().min(u32::MAX as usize) as u32;
         let files: Vec<pb::Manifest> = manifests
             .iter()
             .take(limit)
@@ -451,10 +515,8 @@ pub async fn purge_file(state: &AppState, manifest: &Manifest) -> Result<(), Sto
     let hashes: Vec<[u8; 32]> = manifest.chunks.iter().map(|c| c.hash).collect();
     state.0.index.remove_manifest(&manifest.file_id).await?;
     state.0.cache.manifests.invalidate(&manifest.file_id).await;
-    let zeroed = state.0.index.decr_refcounts(&hashes).await?;
-    for h in &zeroed {
-        state.0.blocks.delete(h).await?;
-    }
+    // C-03: request-path purges share the GC sweep helper ordering.
+    state.0.gc.purge_chunks_now(hashes).await?;
     state.0.replicator.enqueue_purge(manifest.file_id).await?;
     Ok(())
 }
@@ -475,10 +537,15 @@ async fn audit_download(state: &AppState, username: &str, object: &str, status: 
         .await;
 }
 
-/// Returns the trimmed string when non-empty.
-fn non_empty(s: &str) -> Option<&str> {
-    let t = s.trim();
-    (!t.is_empty()).then_some(t)
+/// H-01: maps gate refusals onto gRPC statuses.
+fn gate_status(e: crate::core::gate::GateError) -> Status {
+    use crate::core::gate::GateError;
+    match e {
+        GateError::BudgetExhausted => {
+            Status::resource_exhausted("upload byte budget exhausted (H-01 admission control)")
+        }
+        GateError::TooManyUploads => Status::resource_exhausted("too many concurrent uploads"),
+    }
 }
 
 /// Splits a byte buffer into ≤ `max` pieces without copying when possible.

@@ -6,6 +6,7 @@ use axum::Extension;
 use axum::Json;
 
 use crate::api::dto::{FileListDto, FileSummaryDto, ListQuery};
+use crate::core::validation::ensure_can_list_deleted;
 use crate::error::StorageError;
 use crate::security::auth::AuthContext;
 use crate::state::AppState;
@@ -21,40 +22,26 @@ pub async fn list_files(
     let offset = q.offset.unwrap_or(0);
     let include_deleted = q.include_deleted.unwrap_or(false);
 
-    // Tag filter takes precedence; name filter is an exact match.
-    let (manifests, total) =
-        if let Some(tag) = q.tag.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-            let ids = state.0.index.list_ids_by_tag(&ctx.tenant_id, tag).await?;
-            let mut out = Vec::new();
-            for id in ids {
-                if let Some(m) = state.0.index.get_manifest(&id).await? {
-                    if include_deleted || !m.is_deleted() {
-                        out.push(m);
-                    }
-                }
-            }
-            let total = out.len() as u64;
-            (out, total)
-        } else if let Some(name) = q.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
-            let out: Vec<_> = match state.0.index.get_by_name(&ctx.tenant_id, name).await? {
-                Some(m) if include_deleted || !m.is_deleted() => vec![m],
-                _ => Vec::new(),
-            };
-            let total = out.len() as u64;
-            (out, total)
-        } else {
-            let list = state
-                .0
-                .index
-                .list_by_tenant(&ctx.tenant_id, include_deleted, limit, offset)
-                .await?;
-            let total = state
-                .0
-                .index
-                .count_by_tenant(&ctx.tenant_id, include_deleted)
-                .await?;
-            (list, total)
-        };
+    // M-04a: admin-only on BOTH transports (parity with gRPC ListFiles).
+    // Viewers asking for deleted files get an explicit 403 — no silent
+    // coercion, no silent honoring.
+    if include_deleted {
+        ensure_can_list_deleted(ctx.role)?;
+    }
+
+    // M-04d: THE shared list/count implementation (same code gRPC calls).
+    let (manifests, total) = state
+        .0
+        .index
+        .list_filtered(
+            &ctx.tenant_id,
+            q.tag.as_deref(),
+            q.name.as_deref(),
+            include_deleted,
+            limit,
+            offset,
+        )
+        .await?;
 
     let items: Vec<FileSummaryDto> = manifests
         .iter()

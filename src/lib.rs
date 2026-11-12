@@ -1,8 +1,10 @@
 //! File storage microservice — hybrid chunked content-addressed storage.
 //!
-//! Pipeline: FastCDC chunking -> BLAKE3 hashing -> zstd compression ->
-//! AES-256-GCM (optional, per-tenant) -> content-addressed block store,
-//! with redb as the ACID metadata index and moka as the three-tier cache.
+//! Pipeline: declared-MIME validation against magic bytes (H-03,
+//! `validation.mode: enforce|off`) -> FastCDC chunking -> BLAKE3 hashing ->
+//! zstd compression -> AES-256-GCM (optional, per-tenant) ->
+//! content-addressed block store, with redb as the ACID metadata index and
+//! moka as the three-tier cache.
 
 pub mod api;
 pub mod cache;
@@ -30,8 +32,9 @@ use std::future::IntoFuture as _;
     about = "Hybrid chunked content-addressed file storage service"
 )]
 pub struct Cli {
-    /// Path to the YAML configuration file.
-    #[arg(long, default_value = "config/default.yaml")]
+    /// Path to the YAML configuration file. In containers the path MUST be
+    /// an operator-mounted secret (C-01); `FS_CONFIG` overrides.
+    #[arg(long, env = "FS_CONFIG", default_value = "config/default.yaml")]
     pub config: String,
 
     #[command(subcommand)]
@@ -42,9 +45,10 @@ pub struct Cli {
 pub enum Command {
     /// Generate an argon2id PHC string for `auth.users[].password_hash`.
     HashPassword {
-        /// Plaintext password to hash.
+        /// Plaintext password to hash. When omitted, read from stdin
+        /// (no echo) so the secret never lands in shell history.
         #[arg(long, env = "FS_HASH_PASSWORD")]
-        password: String,
+        password: Option<String>,
     },
 }
 
@@ -55,6 +59,17 @@ pub async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if let Some(Command::HashPassword { password }) = cli.command {
+        let password = match password {
+            Some(p) => p,
+            None => {
+                // C-01: stdin path keeps the secret out of argv/history.
+                eprintln!("enter password to hash:");
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                    .map_err(|e| anyhow::anyhow!("stdin read failed: {e}"))?;
+                buf.trim_end_matches(['\r', '\n']).to_string()
+            }
+        };
         let salt = argon2::password_hash::SaltString::generate(
             &mut argon2::password_hash::rand_core::OsRng,
         );

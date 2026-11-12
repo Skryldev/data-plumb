@@ -219,6 +219,15 @@ where
 {
     let filename = sanitize_filename(name);
     let body = Body::from_stream(stream);
+    // H-03: never replay attacker-chosen active content inline. `nosniff`
+    // always; active-content/document types download as attachments; Vary
+    // closes L-10 (Authorization-dependent responses must not be cached
+    // shared).
+    let disposition = if risky_mime(mime) {
+        "attachment"
+    } else {
+        "inline"
+    };
     (
         status,
         [
@@ -228,8 +237,10 @@ where
             (header::CACHE_CONTROL, http_cache::CACHE_CONTROL.to_string()),
             (
                 header::CONTENT_DISPOSITION,
-                format!("inline; filename=\"{filename}\""),
+                format!("{disposition}; filename=\"{filename}\""),
             ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (header::VARY, "Authorization".to_string()),
             (
                 header::HeaderName::from_static("x-content-hash"),
                 etag.trim_matches('"').to_string(),
@@ -238,6 +249,29 @@ where
         body,
     )
         .into_response()
+}
+
+/// H-03: content types a browser may execute or render dangerously when
+/// served `inline`. Anything starting with `text/` plus the classic active
+/// content families gets forced `attachment`.
+fn risky_mime(mime: &str) -> bool {
+    let base = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "text/html"
+            | "application/xhtml+xml"
+            | "image/svg+xml"
+            | "application/xml"
+            | "text/xml"
+            | "application/javascript"
+            | "application/ecmascript"
+            | "text/javascript"
+    ) || base.starts_with("text/")
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -356,5 +390,24 @@ mod tests {
         assert_eq!(sanitize_filename("ok file_v2.txt"), "ok file_v2.txt");
         assert_eq!(sanitize_filename("bad/../name"), "bad..name");
         assert_eq!(sanitize_filename(""), "download.bin");
+    }
+}
+
+#[cfg(test)]
+mod h03_tests {
+    use super::*;
+
+    #[test]
+    fn risky_mime_table() {
+        assert!(risky_mime("text/html"));
+        assert!(risky_mime("text/html; charset=utf-8"));
+        assert!(risky_mime("image/svg+xml"));
+        assert!(risky_mime("application/xhtml+xml"));
+        assert!(risky_mime("text/plain"));
+        assert!(risky_mime("text/javascript"));
+        assert!(!risky_mime("image/png"));
+        assert!(!risky_mime("application/pdf"));
+        assert!(!risky_mime("application/octet-stream"));
+        assert!(!risky_mime("application/json"));
     }
 }

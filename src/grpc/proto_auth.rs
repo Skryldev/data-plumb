@@ -105,9 +105,10 @@ pub fn status_from_error(e: &StorageError) -> Status {
         StorageError::Validation(_) => Code::InvalidArgument,
         StorageError::Unauthorized(_) => Code::Unauthenticated,
         StorageError::Forbidden(_) => Code::PermissionDenied,
-        StorageError::Conflict(_) => Code::AlreadyExists,
+        StorageError::Conflict(_) => Code::FailedPrecondition,
         StorageError::TooLarge(_) => Code::ResourceExhausted,
         StorageError::RangeNotSatisfiable(_) => Code::OutOfRange,
+        StorageError::UnsupportedMediaType(_) => Code::FailedPrecondition,
         StorageError::HashMismatch { .. } => Code::DataLoss,
         StorageError::Corruption(_) => Code::DataLoss,
         StorageError::Compression(_) => Code::Internal,
@@ -118,6 +119,7 @@ pub fn status_from_error(e: &StorageError) -> Status {
         StorageError::Serialization(_) => Code::Internal,
         StorageError::Replication(_) => Code::Unavailable,
         StorageError::Unavailable(_) => Code::Unavailable,
+        StorageError::Throttled(_) => Code::ResourceExhausted,
         StorageError::Internal(_) => Code::Internal,
     };
     Status::new(code, e.to_string())

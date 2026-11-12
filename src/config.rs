@@ -6,6 +6,31 @@ use uuid::Uuid;
 
 use crate::error::{internal, StorageError};
 
+/// C-01: literals that must never authenticate a boot. Keep in sync with
+/// `docs/src/operations/bootstrap.md`; extend when the repo ships new
+/// example configs. Matching is a substring check on `auth.jwt_secret` and
+/// `replication.api_key`.
+pub const FORBIDDEN_SECRET_MARKERS: &[&str] = &[
+    "change-me",
+    "admin123",
+    "alice123",
+    "bob123",
+    "viewer123",
+    "internal-dev-api-key",
+    "cluster-api-key",
+    "insecure",
+    "replace_with",
+];
+
+/// Build profile used by [`AppConfig::validate_for`]. Debug builds may use
+/// plaintext passwords as a local-dev convenience; release builds require
+/// argon2id PHC strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityProfile {
+    Debug,
+    Release,
+}
+
 /// Root configuration object, mirroring `config/default.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -22,6 +47,10 @@ pub struct AppConfig {
     pub replication: ReplicationConfig,
     pub retention: RetentionConfig,
     pub limits: LimitsConfig,
+    /// H-05/M-17: exposure policy for the ops endpoints.
+    pub metrics: MetricsConfig,
+    /// H-03: upload content validation policy.
+    pub validation: ValidationConfig,
     pub logging: LoggingConfig,
     pub tenants: Vec<TenantSeed>,
 }
@@ -53,6 +82,33 @@ pub struct StorageConfig {
     pub root: PathBuf,
     pub temp_dir: PathBuf,
     pub shard_depth: u32,
+    /// M-07: ceiling for the quarantine directory that holds untrusted
+    /// blobs rejected by repair verification. Oldest-mtime files are
+    /// evicted first. Not subject to tenant quota — it is an ops surface.
+    #[serde(default = "default_quarantine_max_bytes")]
+    pub quarantine_max_bytes: u64,
+    /// M-07: quarantine files older than this are swept at boot.
+    #[serde(default = "default_quarantine_retention_secs")]
+    pub quarantine_retention_secs: u64,
+}
+
+fn default_quarantine_max_bytes() -> u64 {
+    1024 * 1024 * 1024 // 1 GiB
+}
+
+fn default_quarantine_retention_secs() -> u64 {
+    7 * 24 * 3600 // 7 days
+}
+
+impl StorageConfig {
+    /// M-07: quarantine lives OUTSIDE the CAS blob walk (a sibling of the
+    /// blocks dir) so reconcile/GC never sees quarantined bytes as blobs.
+    pub fn quarantine_dir(&self) -> PathBuf {
+        self.root
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("quarantine")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -79,8 +135,17 @@ pub struct CacheConfig {
     pub l1_ttl_secs: u64,
     pub l2_max_bytes: u64,
     pub l2_ttl_secs: u64,
+    /// Deprecated in favor of `manifest_max_bytes` (H-01): kept parsed for
+    /// config compatibility, no longer drives the L3 bound.
     pub manifest_capacity: u64,
     pub manifest_ttl_secs: u64,
+    /// H-01: byte-based L3 budget (weighed by manifest size).
+    #[serde(default = "default_manifest_max_bytes")]
+    pub manifest_max_bytes: u64,
+}
+
+fn default_manifest_max_bytes() -> u64 {
+    64 * 1024 * 1024 // 64 MiB
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -89,6 +154,42 @@ pub struct AuthConfig {
     pub access_ttl_secs: u64,
     pub refresh_ttl_secs: u64,
     pub users: Vec<UserConfig>,
+    /// M-05: per-username exponential login lockout. Security control —
+    /// defaulted ON (fail-closed on secrets-adjacent paths).
+    #[serde(default)]
+    pub login_throttle: ThrottleConfig,
+}
+
+/// M-05: exponential backoff for repeated login failures. `check` runs
+/// BEFORE the argon2 verify (cheap-fail protects the 64 MiB budget);
+/// lockout doubles per consecutive failure up to `lockout_cap_ms` and
+/// resets on success. The throttle itself is fail-OPEN (a cache miss or
+/// internal error must never block a legitimate login) while the
+/// verifier underneath stays fail-CLOSED (rule 17).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThrottleConfig {
+    pub enabled: bool,
+    /// Lockout after the FIRST failure.
+    pub base_ms: u64,
+    /// Multiplier applied per additional consecutive failure.
+    pub multiplier: f64,
+    /// Never lock out longer than this.
+    pub lockout_cap_ms: u64,
+    /// Bound on tracked usernames (oldest-evicted, never wholesale-cleared).
+    pub map_capacity: u64,
+}
+
+impl Default for ThrottleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base_ms: 1_000,
+            multiplier: 2.0,
+            lockout_cap_ms: 15 * 60 * 1_000,
+            map_capacity: 10_000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +248,10 @@ pub struct RateLimitConfig {
 pub struct ReplicationConfig {
     pub enabled: bool,
     pub mode: ReplicationMode,
+    /// Cluster role of THIS node (C-02): replicas must never run refcount
+    /// GC or refcount-based purges — reclamation is reachability-only.
+    #[serde(default)]
+    pub role: NodeRole,
     pub target_url: Option<String>,
     pub upstream_url: Option<String>,
     pub api_key: String,
@@ -154,6 +259,22 @@ pub struct ReplicationConfig {
     pub batch_size: usize,
     pub flush_interval_ms: u64,
     pub sync_timeout_ms: u64,
+    /// M-14: bounded enqueue wait before the fail-open drop / sync failure.
+    #[serde(default = "default_enqueue_timeout_ms")]
+    pub enqueue_timeout_ms: u64,
+}
+
+fn default_enqueue_timeout_ms() -> u64 {
+    5_000
+}
+
+/// Node role in the replication topology (C-02 guard).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeRole {
+    #[default]
+    Primary,
+    Replica,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +291,16 @@ pub struct RetentionConfig {
     pub grace_period_secs: u64,
     pub gc_interval_secs: u64,
     pub orphan_min_age_secs: u64,
+    /// M-01: seconds between drift-reconciliation passes (0 disables).
+    /// The pass tombstones refcount>0 rows with zero manifest references
+    /// and lets the normal sweep reclaim them — the permanent guarantee
+    /// behind the transaction-sized C-03 crash window.
+    #[serde(default = "default_reconcile_interval_secs")]
+    pub reconcile_interval_secs: u64,
+}
+
+fn default_reconcile_interval_secs() -> u64 {
+    3600
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +318,63 @@ pub enum GcMode {
 pub struct LimitsConfig {
     pub max_file_size: u64,
     pub max_body: usize,
+    /// H-01: global byte budget for in-flight upload reservations.
+    #[serde(default = "default_in_flight_bytes")]
+    pub max_in_flight_bytes: u64,
+    /// H-01: global cap on concurrent upload pipeline tasks.
+    #[serde(default = "default_max_concurrent_uploads")]
+    pub max_concurrent_uploads: usize,
+}
+
+fn default_in_flight_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024 // 2 GiB
+}
+
+fn default_max_concurrent_uploads() -> usize {
+    64
+}
+
+/// H-05/M-17: how `/metrics` (and other ops endpoints) may be reached.
+/// Default `loopback` — fail-closed; `public` is an explicit operator
+/// opt-in that logs a startup warning naming the risk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MetricsExposure {
+    /// Only loopback peers may fetch /metrics.
+    #[default]
+    Loopback,
+    /// Any peer presenting the configured api key.
+    ApiKey,
+    /// Public (dev only) — startup warning.
+    Public,
+}
+
+/// H-03: content validation policy. Default `enforce` (fail-closed) — the
+/// pipeline checks the declared MIME against the sniffed magic bytes of the
+/// first plaintext chunk BEFORE persisting anything. `off` is an explicit
+/// operator opt-out (logged at boot); the safe serving headers apply
+/// regardless (defense in depth).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ValidationMode {
+    #[default]
+    Enforce,
+    Off,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ValidationConfig {
+    #[serde(default)]
+    pub mode: ValidationMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MetricsConfig {
+    #[serde(default)]
+    pub exposure: MetricsExposure,
+    /// Required when exposure = api_key (constant-time compared).
+    #[serde(default)]
+    pub api_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -235,6 +423,8 @@ impl AppConfig {
                 root: PathBuf::from("data/blocks"),
                 temp_dir: PathBuf::from("data/tmp"),
                 shard_depth: 2,
+                quarantine_max_bytes: default_quarantine_max_bytes(),
+                quarantine_retention_secs: default_quarantine_retention_secs(),
             },
             database: DatabaseConfig {
                 path: PathBuf::from("data/index.redb"),
@@ -255,11 +445,14 @@ impl AppConfig {
                 l2_ttl_secs: 3600,
                 manifest_capacity: 10_000,
                 manifest_ttl_secs: 60,
+                manifest_max_bytes: 64 * 1024 * 1024,
             },
             auth: AuthConfig {
-                jwt_secret: "test-secret-0123456789abcdef".into(),
+                // C-01: >= 32 chars, no shipped literal. Test-only value.
+                jwt_secret: "test-only-secret-0123456789abcdef-0123456789abcdef".into(),
                 access_ttl_secs: 900,
                 refresh_ttl_secs: 604_800,
+                login_throttle: ThrottleConfig::default(),
                 users: vec![
                     UserConfig {
                         username: "admin".into(),
@@ -303,24 +496,31 @@ impl AppConfig {
             replication: ReplicationConfig {
                 enabled: false,
                 mode: ReplicationMode::Async,
+                role: crate::config::NodeRole::Primary,
                 target_url: None,
                 upstream_url: None,
-                api_key: "test-internal-key".into(),
+                api_key: "test-internal-key-0123456789abcdef".into(),
                 queue_capacity: 10_000,
                 batch_size: 64,
                 flush_interval_ms: 5_000,
                 sync_timeout_ms: 5_000,
+                enqueue_timeout_ms: 5_000,
             },
             retention: RetentionConfig {
                 gc_mode: GcMode::Refcount,
                 grace_period_secs: 86_400,
                 gc_interval_secs: 300,
                 orphan_min_age_secs: 3_600,
+                reconcile_interval_secs: 0, // tests: reconcile is admin-triggered
             },
             limits: LimitsConfig {
                 max_file_size: 1024 * 1024 * 1024,
                 max_body: 1024 * 1024 * 1024,
+                max_in_flight_bytes: 512 * 1024 * 1024,
+                max_concurrent_uploads: 32,
             },
+            metrics: MetricsConfig::default(),
+            validation: ValidationConfig::default(),
             logging: LoggingConfig {
                 format: "pretty".into(),
                 level: "info".into(),
@@ -343,69 +543,118 @@ impl AppConfig {
     }
 
     /// Cross-field sanity checks. Fails fast at boot instead of corrupting data.
+    ///
+    /// C-01: fail-closed on secrets. Uses the build's own profile
+    /// (release builds reject plaintext passwords outright); see
+    /// [`validate_for`](Self::validate_for) for the profile-explicit form.
     pub fn validate(&self) -> Result<(), StorageError> {
+        let profile = if cfg!(debug_assertions) {
+            SecurityProfile::Debug
+        } else {
+            SecurityProfile::Release
+        };
+        self.validate_for(profile)
+    }
+
+    /// C-01: profile-explicit validation reporting ALL violations at once.
+    ///
+    /// * Every shipped/known literal is rejected in every profile.
+    /// * `auth.jwt_secret` needs >= 32 random bytes, `replication.api_key` >= 24.
+    /// * Plaintext `password` is a Debug-profile convenience; Release requires
+    ///   argon2id `password_hash` PHC strings.
+    pub fn validate_for(&self, profile: SecurityProfile) -> Result<(), StorageError> {
+        let mut errs: Vec<String> = Vec::new();
+
+        // -- secrets ------------------------------------------------------
+        let jwt = &self.auth.jwt_secret;
+        if jwt.len() < 32 {
+            errs.push(format!(
+                "auth.jwt_secret: {} chars, need >= 32 random bytes (openssl rand -hex 32)",
+                jwt.len()
+            ));
+        }
+        if FORBIDDEN_SECRET_MARKERS.iter().any(|m| jwt.contains(m)) {
+            errs.push(
+                "auth.jwt_secret: matches a shipped/known literal; generate a fresh secret"
+                    .to_string(),
+            );
+        }
+        let api = &self.replication.api_key;
+        if api.len() < 24 {
+            errs.push(format!(
+                "replication.api_key: {} chars, need >= 24",
+                api.len()
+            ));
+        }
+        if FORBIDDEN_SECRET_MARKERS.iter().any(|m| api.contains(m)) {
+            errs.push("replication.api_key: matches a shipped/known literal".to_string());
+        }
+
+        // -- users --------------------------------------------------------
+        for (i, u) in self.auth.users.iter().enumerate() {
+            match (&u.password, &u.password_hash) {
+                (Some(_), Some(_)) => errs.push(format!(
+                    "auth.users[{i}] '{}': set exactly one of `password` (debug) or `password_hash`",
+                    u.username
+                )),
+                (Some(_), None) if profile == SecurityProfile::Release => errs.push(format!(
+                    "auth.users[{i}] '{}': plaintext `password` is forbidden in release builds; \
+                     use `password_hash` (argon2id PHC string)",
+                    u.username
+                )),
+                (None, None) => errs.push(format!(
+                    "auth.users[{i}] '{}': no credential configured",
+                    u.username
+                )),
+                (None, Some(h)) if !h.starts_with("$argon2id$") => errs.push(format!(
+                    "auth.users[{i}] '{}': password_hash must be an argon2id PHC string",
+                    u.username
+                )),
+                _ => {}
+            }
+        }
+        if self.auth.users.is_empty() {
+            errs.push("at least one auth user is required".to_string());
+        }
+
+        // -- structural checks (unchanged semantics, collected) -----------
         if self.chunking.min == 0
             || self.chunking.avg < self.chunking.min
             || self.chunking.max < self.chunking.avg
         {
-            return Err(StorageError::Validation(
-                "chunking must satisfy min <= avg <= max and min > 0".into(),
-            ));
+            errs.push("chunking must satisfy min <= avg <= max and min > 0".to_string());
         }
         if self.chunking.max > 16 * 1024 * 1024 {
-            return Err(StorageError::Validation(
-                "chunking.max must be <= 16 MiB".into(),
-            ));
+            errs.push("chunking.max must be <= 16 MiB".to_string());
         }
         if !(1..=22).contains(&self.compression.level) {
-            return Err(StorageError::Validation(
-                "compression.level must be in 1..=22".into(),
-            ));
-        }
-        if self.auth.jwt_secret.len() < 16 {
-            return Err(StorageError::Validation(
-                "auth.jwt_secret must be >= 16 chars".into(),
-            ));
-        }
-        if self.auth.users.is_empty() {
-            return Err(StorageError::Validation(
-                "at least one auth user is required".into(),
-            ));
-        }
-        for u in &self.auth.users {
-            if u.password.is_none() && u.password_hash.is_none() {
-                return Err(StorageError::Validation(format!(
-                    "user {} needs `password` or `password_hash`",
-                    u.username
-                )));
-            }
+            errs.push("compression.level must be in 1..=22".to_string());
         }
         if self.replication.enabled {
             if self.replication.target_url.is_none() {
-                return Err(StorageError::Validation(
-                    "replication.target_url is required when replication is enabled".into(),
-                ));
+                errs.push(
+                    "replication.target_url is required when replication is enabled".to_string(),
+                );
             }
             if self.replication.batch_size == 0 {
-                return Err(StorageError::Validation(
-                    "replication.batch_size must be > 0".into(),
-                ));
+                errs.push("replication.batch_size must be > 0".to_string());
             }
         }
         if self.storage.shard_depth > 4 {
-            return Err(StorageError::Validation(
-                "storage.shard_depth must be <= 4".into(),
-            ));
+            errs.push("storage.shard_depth must be <= 4".to_string());
         }
         if self.server.grpc_tls.enabled
             && (self.server.grpc_tls.cert_path.as_os_str().is_empty()
                 || self.server.grpc_tls.key_path.as_os_str().is_empty())
         {
-            return Err(StorageError::Validation(
-                "server.grpc_tls requires cert_path and key_path".into(),
-            ));
+            errs.push("server.grpc_tls requires cert_path and key_path".to_string());
         }
-        Ok(())
+
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(StorageError::Validation(errs.join("; ")))
+        }
     }
 
     /// Points all state directories at a fresh temporary root (tests).
@@ -421,6 +670,77 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- C-01 gates -------------------------------------------------------
+
+    #[test]
+    fn c01_config_rejects_every_shipped_literal() {
+        for marker in FORBIDDEN_SECRET_MARKERS {
+            let mut cfg = AppConfig::for_tests();
+            cfg.auth.jwt_secret = format!("operator-supplied-{marker}-padding-0123456789");
+            assert!(
+                cfg.validate_for(SecurityProfile::Release).is_err(),
+                "jwt_secret containing shipped literal '{marker}' must not boot"
+            );
+            let mut cfg = AppConfig::for_tests();
+            cfg.replication.api_key = format!("operator-supplied-{marker}-padding-0123456789");
+            assert!(
+                cfg.validate_for(SecurityProfile::Release).is_err(),
+                "api_key containing shipped literal '{marker}' must not boot"
+            );
+        }
+    }
+
+    #[test]
+    fn c01_config_rejects_plaintext_password_in_release() {
+        let cfg = AppConfig::for_tests();
+        // Debug profile accepts plaintext (local-dev convenience).
+        cfg.validate_for(SecurityProfile::Debug)
+            .expect("debug profile allows plaintext passwords");
+        // Release profile rejects it.
+        let err = cfg
+            .validate_for(SecurityProfile::Release)
+            .expect_err("release profile must reject plaintext passwords");
+        assert!(
+            err.to_string().contains("forbidden in release builds"),
+            "message must name the rule: {err}"
+        );
+    }
+
+    #[test]
+    fn c01_config_reports_all_violations() {
+        let mut cfg = AppConfig::for_tests();
+        cfg.auth.jwt_secret = "short".into();
+        cfg.replication.api_key = "change-me-in-production".into();
+        let err = cfg.validate_for(SecurityProfile::Release).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("auth.jwt_secret"),
+            "both violations reported: {msg}"
+        );
+        assert!(
+            msg.contains("replication.api_key"),
+            "both violations reported: {msg}"
+        );
+    }
+
+    #[test]
+    fn c01_config_rejects_short_secrets() {
+        let mut cfg = AppConfig::for_tests();
+        cfg.auth.jwt_secret = "x".repeat(31);
+        assert!(cfg.validate_for(SecurityProfile::Release).is_err());
+        let mut cfg = AppConfig::for_tests();
+        cfg.replication.api_key = "x".repeat(23);
+        assert!(cfg.validate_for(SecurityProfile::Release).is_err());
+    }
+
+    #[test]
+    fn c01_config_rejects_non_argon2id_hash() {
+        let mut cfg = AppConfig::for_tests();
+        cfg.auth.users[0].password = None;
+        cfg.auth.users[0].password_hash = Some("$argon2i$v=19$...".into());
+        assert!(cfg.validate_for(SecurityProfile::Release).is_err());
+    }
 
     #[test]
     fn for_tests_passes_validation() {

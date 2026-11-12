@@ -128,7 +128,7 @@ async fn internal_endpoints_apply_bundles() {
     let bundle = primary
         .client()
         .get(format!("{}/internal/file/{file_id}", primary.base))
-        .header("X-Api-Key", "test-internal-key")
+        .header("X-Api-Key", "test-internal-key-0123456789abcdef")
         .send()
         .await
         .unwrap();
@@ -138,7 +138,7 @@ async fn internal_endpoints_apply_bundles() {
     let applied = replica
         .client()
         .post(format!("{}/internal/file/{file_id}", replica.base))
-        .header("X-Api-Key", "test-internal-key")
+        .header("X-Api-Key", "test-internal-key-0123456789abcdef")
         .header("Content-Type", "application/octet-stream")
         .body(bundle)
         .send()

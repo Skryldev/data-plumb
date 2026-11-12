@@ -52,6 +52,16 @@ pub const M_RPC_DURATION: &str = "file_storage_grpc_request_duration_seconds";
 pub const M_RPC_REQUESTS: &str = "file_storage_grpc_requests_total";
 pub const M_AUDIT_EVENTS: &str = "file_storage_audit_events_total";
 pub const M_UPTIME: &str = "file_storage_uptime_seconds";
+pub const M_REGISTER_RACE: &str = "file_storage_chunk_register_race_total";
+pub const M_REPL_ENQUEUED: &str = "file_storage_replication_ops_enqueued_total";
+pub const M_REPL_ACKED: &str = "file_storage_replication_ops_acked_total";
+pub const M_REPL_LAG: &str = "file_storage_replication_lag_ops";
+pub const M_REPL_DROPPED: &str = "file_storage_replication_dropped_ops_total";
+pub const M_BOOT_TMP_SWEPT: &str = "file_storage_startup_tmp_swept_total";
+pub const M_REPAIR_MISMATCH: &str = "file_storage_repair_hash_mismatch_total";
+pub const M_REPAIR_CIPHERTEXT: &str = "file_storage_repair_ciphertext_only_total";
+pub const M_BOOT_QUARANTINE_SWEPT: &str = "file_storage_startup_quarantine_swept";
+pub const M_GC_RECONCILE_LEAKED: &str = "file_storage_gc_reconcile_leaked_total";
 
 /// Records an upload completion.
 pub fn record_upload(dur_secs: f64, status: &'static str, bytes: u64, dedup_bytes: u64) {
@@ -118,6 +128,63 @@ pub fn record_http_request(method: &str, route: &str, status: u16, dur_secs: f64
         .record(dur_secs);
 }
 
+// -- M-02: replication queue accounting (counter vs gauge vs lag) -----------
+
+pub fn record_replication_enqueued() {
+    metrics::counter!(M_REPL_ENQUEUED).increment(1);
+}
+
+pub fn record_replication_acked(n: u64) {
+    metrics::counter!(M_REPL_ACKED).increment(n);
+}
+
+pub fn set_replication_lag(ops: f64) {
+    metrics::gauge!(M_REPL_LAG).set(ops);
+}
+
+pub fn record_replication_dropped(n: u64) {
+    metrics::counter!(M_REPL_DROPPED).increment(n);
+}
+
+// -- M-06: boot sweep ------------------------------------------------------------------
+
+pub fn record_startup_tmp_swept(n: u64) {
+    metrics::counter!(M_BOOT_TMP_SWEPT).increment(n);
+}
+
+// -- M-07: repair-path verification ----------------------------------------------------
+
+/// Hostile bytes rejected by repair verification (source="repair").
+pub fn record_repair_hash_mismatch() {
+    metrics::counter!(M_REPAIR_MISMATCH, "source" => "repair").increment(1);
+}
+
+/// Repairs performed WITHOUT content verification (ciphertext-only
+/// replica posture — documented degraded mode, warn-logged per event).
+pub fn record_repair_ciphertext_only() {
+    metrics::counter!(M_REPAIR_CIPHERTEXT, "source" => "repair_ciphertext_only").increment(1);
+}
+
+pub fn record_startup_quarantine_swept(n: u64) {
+    metrics::counter!(M_BOOT_QUARANTINE_SWEPT).increment(n);
+}
+
+/// M-01: leaked (orphaned) chunks observed by a reconcile Repair pass.
+/// Expected ~0 on a healthy cluster; steady growth means the crash window
+/// is being exercised (or operators are killing -9 mid-upload).
+pub fn record_reconcile_leaked(n: u64) {
+    if n > 0 {
+        metrics::counter!(M_GC_RECONCILE_LEAKED).increment(n);
+    }
+}
+
+/// C-03: counts chunk registrations rejected because a racing GC/purge
+/// removed the blob between write and registration (expected ~0; alert if
+/// it grows steadily — it indicates uploads are repeatedly self-healing).
+pub fn record_register_race(rejected: u64) {
+    metrics::counter!(M_REGISTER_RACE).increment(rejected);
+}
+
 /// Records one gRPC call (unary and streaming). `rpc` is the full method
 /// path (`/file_storage.v1.FileService/Upload`), `code` the gRPC status
 /// name (`ok` on success) — dashboards group by transport via the metric
@@ -152,4 +219,18 @@ pub fn normalize_path(path: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn uptime_gauge_renders_once_set() {
+        super::init_recorder();
+        super::set_uptime(42.0);
+        let body = super::render();
+        assert!(
+            body.contains("file_storage_uptime_seconds"),
+            "uptime gauge must render after set_uptime; body:\n{body}"
+        );
+    }
 }

@@ -52,13 +52,9 @@ impl Encryptor {
         } else {
             let key: [u8; 32] = rand::random();
             use std::io::Write as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-                .map_err(dbe)?;
+            // M-13: 0o600 semantics are POSIX; on other platforms the
+            // weakening is explicit and logged, never silent.
+            let mut f = open_new_key_file(&path).map_err(dbe)?;
             f.write_all(hex::encode(key).as_bytes()).map_err(dbe)?;
             f.sync_all().map_err(dbe)?;
             key
@@ -136,6 +132,31 @@ pub fn key_file_permissions_ok(path: &Path) -> bool {
     match std::fs::metadata(path) {
         Ok(m) => m.permissions().mode() & 0o077 == 0,
         Err(_) => false,
+    }
+}
+
+/// M-13: creates a fresh key file. Unix keeps exact 0o600 semantics;
+/// non-unix platforms get an explicit logged weakening (no silent divergence).
+fn open_new_key_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600) // unix semantics preserved exactly
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        tracing::warn!(
+            "non-unix platform: key file created WITHOUT 0o600 guarantee; \
+             restrict permissions at the volume/filesystem level"
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
     }
 }
 

@@ -5,13 +5,15 @@
 //!
 //! 1. JWT verification (`authorization: Bearer <jwt>`);
 //! 2. optional admin gate;
-//! 3. per-tenant rate limiting;
+//! 3. per-tenant rate limiting (the SHARED governor in `AppState`);
 //! 4. request-id propagation (reuse or mint `x-request-id`).
 //!
 //! Finally it inserts the [`AuthContext`] into request extensions.
 //!
 //! Streaming RPCs bypass interceptors entirely — they call
-//! [`crate::grpc::proto_auth`] helpers inside their handlers instead.
+//! [`crate::grpc::proto_auth`] helpers inside their handlers and take
+//! their rate tokens from the SAME shared governor at handler entry
+//! (M-05 closed the streaming bypass; see `file_service.rs`).
 
 use tonic::{Request, Status};
 
@@ -29,32 +31,31 @@ pub struct AuthInterceptor {
 }
 
 impl AuthInterceptor {
-    /// Auth + rate limit + request-id (FileService).
+    /// Auth + rate limit + request-id (FileService). Uses the SHARED
+    /// governor from `AppState` so unary and streaming share one budget.
     pub fn file_service(state: AppState) -> Self {
-        let cfg = &state.0.cfg.rate_limit;
         Self {
-            limiter: Some(RateLimiter::from_cfg(
-                cfg.enabled,
-                cfg.per_second,
-                cfg.burst,
-            )),
+            limiter: Some(state.0.rate_limiter.clone()),
             state,
             admin_required: false,
         }
     }
 
-    /// Admin-gated variant (AdminService).
+    /// Admin-gated variant (AdminService) — same shared governor.
     pub fn admin_service(state: AppState) -> Self {
-        let cfg = &state.0.cfg.rate_limit;
         Self {
-            limiter: Some(RateLimiter::from_cfg(
-                cfg.enabled,
-                cfg.per_second,
-                cfg.burst,
-            )),
+            limiter: Some(state.0.rate_limiter.clone()),
             state,
             admin_required: true,
         }
+    }
+
+    /// M-05 gate helper: identity pointer of the governor this interceptor
+    /// uses (tests assert it equals the streaming handlers' pointer).
+    pub fn rate_limiter_ptr(&self) -> Option<usize> {
+        self.limiter
+            .as_ref()
+            .map(crate::grpc::interceptors::rate_limit::RateLimiter::instance_ptr)
     }
 }
 

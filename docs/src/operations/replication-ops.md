@@ -55,7 +55,11 @@ On flush failure the worker backs off exponentially — 100 ms, then 500 ms, the
 
 ### Repair procedure 1 — automatic on-miss pull
 
-For reads: if a blob is missing on the replica (its `storage.root`), the read path fetches it from `replication.upstream_url`, stores it and serves the data. Requires nothing but `upstream_url` + matching `api_key`. This repairs *blobs*, not missing manifests.
+For reads: if a blob is missing on the replica (its `storage.root`), the read path fetches it from `replication.upstream_url`, verifies it, stores it and serves the data. Requires nothing but `upstream_url` + matching `api_key`. This repairs *blobs*, not missing manifests.
+
+**M-07 verify-then-persist (normative since V5 Wave 2).** Pulled bytes are UNTRUSTED. When the replica can verify — plaintext chunks always, encrypted chunks whenever the replica holds the tenant key (the documented compose mode) — the decrypted+decompressed plaintext must BLAKE3-match the chunk reference's `plain_hash` BEFORE anything is written to the CAS or L2. On mismatch the hostile bytes are quarantined, the cache entry invalidated, the caller gets `corruption`, and `file_storage_repair_hash_mismatch_total{source="repair"}` ticks (page it: a growing rate means a compromised or broken upstream). A replica WITHOUT the tenant key cannot verify; those repairs keep the legacy order with a per-event `warn!` and `file_storage_repair_ciphertext_only_total` — treat that series as a posture alarm (see threat model, residual risks).
+
+**Quarantine.** Rejected bytes land in `<storage.root>/../quarantine/<hash>.bin` — an ops surface outside the CAS walk, never counted against tenant quota. Bounds: `storage.quarantine_max_bytes` (default 1 GiB, oldest-mtime eviction) and `storage.quarantine_retention_secs` (default 7 d, swept at boot; `file_storage_startup_quarantine_swept` reports how much evidence aged out). Inspect before deleting: the quarantined bytes are the exact bytes the upstream served.
 
 ### Repair procedure 2 — admin resync per file
 

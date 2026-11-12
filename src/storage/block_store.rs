@@ -63,6 +63,13 @@ impl BlockStore {
 
     /// Atomically writes a blob. Returns `true` if the blob was written,
     /// `false` when it already existed (idempotent).
+    /// C-03: synchronous presence check for a relative blob path. Used
+    /// INSIDE the verified-registration transaction (runs on the blocking
+    /// pool, so a stat syscall here is fine).
+    pub fn path_exists(&self, relative: &str) -> bool {
+        std::fs::metadata(self.root.join(relative)).is_ok()
+    }
+
     pub async fn write(&self, hash: &[u8; 32], data: &[u8]) -> Result<bool, StorageError> {
         let (dir, path) = self.shard_path(hash);
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
@@ -152,6 +159,83 @@ impl BlockStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(dbe(e)),
         }
+    }
+
+    // -- GC two-phase delete barrier (regression W1-C-03 fix) ---------------
+    //
+    // The Wave-1 sweep re-checked references BEFORE the unlink, so an
+    // upload could register a chunk in the gap between that re-check and
+    // the unlink — the blob then vanished under a live row (dangling
+    // manifest). The barrier makes the claim atomic: rename aside →
+    // resurrection re-check → delete, or restore when an upload re-created
+    // the row. The uploader's verified registration sees the canonical
+    // path disappear and self-heals by rewriting (CAS: identical bytes).
+
+    /// Atomically claims a blob for deletion by renaming it aside.
+    /// Returns false when the blob is absent (or already claimed).
+    pub async fn claim_for_gc(&self, hash: &[u8; 32]) -> Result<bool, StorageError> {
+        let (dir, path) = self.shard_path(hash);
+        let pending = dir.join(format!(
+            "{}.{}.{pending_suffix}",
+            hex::encode(hash),
+            uuid::Uuid::now_v7().simple(),
+            pending_suffix = Self::GC_PENDING_SUFFIX
+        ));
+        match tokio::fs::rename(&path, &pending).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(dbe(e)),
+        }
+    }
+
+    /// Suffix for claimed blobs (never matched by `list_all`, which only
+    /// accepts `<hex>.bin`).
+    pub const GC_PENDING_SUFFIX: &str = "gc-pending";
+
+    /// Restores a claimed blob (resurrection): rename back to canonical.
+    /// When the canonical path was re-written meanwhile (uploader self-heal
+    /// rewrites identical CAS bytes), the claimed copy is dropped instead.
+    pub async fn restore_claimed(&self, hash: &[u8; 32]) -> Result<(), StorageError> {
+        let (_, path) = self.shard_path(hash);
+        if let Some(pending) = self.find_pending(hash).await? {
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                // Canonical re-written by a self-healing upload — same CAS
+                // content; drop the stale claim.
+                let _ = tokio::fs::remove_file(&pending).await;
+            } else {
+                let _ = tokio::fs::rename(&pending, &path).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Deletes a claimed blob (the deletion is now final: no row exists).
+    pub async fn delete_claimed(&self, hash: &[u8; 32]) -> Result<(), StorageError> {
+        let (dir, _) = self.shard_path(hash);
+        if let Some(pending) = self.find_pending(hash).await? {
+            let _ = tokio::fs::remove_file(&pending).await;
+        }
+        let _ = dir;
+        Ok(())
+    }
+
+    /// Finds a claimed blob in the shard dir (crash leftovers may leave
+    /// several; the first is returned, boot sweep cleans stale ones).
+    async fn find_pending(&self, hash: &[u8; 32]) -> Result<Option<PathBuf>, StorageError> {
+        let (dir, _) = self.shard_path(hash);
+        let prefix = format!("{}.", hex::encode(hash));
+        let mut rd = match tokio::fs::read_dir(&dir).await {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(dbe(e)),
+        };
+        while let Some(e) = rd.next_entry().await.map_err(dbe)? {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with(&prefix) && name.ends_with(Self::GC_PENDING_SUFFIX) {
+                return Ok(Some(e.path()));
+            }
+        }
+        Ok(None)
     }
 
     /// Lists every stored hash (used by the orphan sweeper). Walks the

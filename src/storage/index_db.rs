@@ -37,6 +37,43 @@ pub struct IndexDb {
 /// Result of an upload's chunk registration: per-chunk `true` = dedup hit.
 pub type UpsertReport = Vec<bool>;
 
+/// One chunk registration request (C-03): everything needed to create or
+/// merge a `ChunkMeta` row, plus the path used for the in-transaction blob
+/// presence check.
+#[derive(Debug, Clone)]
+pub struct ChunkRegistration {
+    pub hash: [u8; 32],
+    pub size_stored: u64,
+    pub on_disk_path: String,
+}
+
+/// C-03: outcome of verified batch registration.
+#[derive(Debug, Default, Clone)]
+pub struct RegisterReport {
+    /// hashes registered fresh (row created, refcount 1)
+    pub fresh: Vec<[u8; 32]>,
+    /// hashes that dedup-hit (row existed, refcount incremented in-txn)
+    pub dedup_hit: Vec<[u8; 32]>,
+    /// hashes whose blob is GONE — no row was written for them
+    pub rejected_missing_blob: Vec<[u8; 32]>,
+}
+
+/// Outcome of the single-chunk verified registration used by the streaming
+/// pipeline (H-01): payload lifetime is one chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterOne {
+    Fresh,
+    DedupHit,
+    /// Blob absent at registration time — no row was written.
+    RejectedMissingBlob,
+}
+
+impl RegisterOne {
+    pub fn is_dedup_hit(&self) -> bool {
+        matches!(self, RegisterOne::DedupHit)
+    }
+}
+
 impl IndexDb {
     pub fn open(path: &std::path::Path) -> Result<Self, StorageError> {
         if let Some(parent) = path.parent() {
@@ -189,43 +226,62 @@ impl IndexDb {
         .await
     }
 
-    /// Batch registration used by the upload pipeline: a single atomic
-    /// transaction (one fsync) handles every chunk of a file. For each
-    /// `(hash, blob_size, path)`: existing -> refcount += 1 (dedup hit);
-    /// absent -> insert with refcount 1.
-    pub async fn register_chunks(
+    /// C-03: batched registration with in-transaction blob presence
+    /// verification. ONE write txn (Durability::Immediate preserved), one
+    /// pass: for each reg, if the meta row exists the blob is verified and
+    /// the refcount incremented (dedup hit); otherwise the blob is verified
+    /// and a row with refcount 1 is created. Missing blob => NO row; the
+    /// hash lands in `RegisterReport::rejected_missing_blob` so the caller
+    /// (upload pipeline) can self-heal by rewriting the blob.
+    ///
+    /// The race window collapses from "the entire upload stream" to "one
+    /// syscall inside the registration transaction".
+    pub async fn register_chunks_verified(
         &self,
-        items: Vec<([u8; 32], u64, String)>,
-    ) -> Result<UpsertReport, StorageError> {
+        regs: Vec<ChunkRegistration>,
+        blob_exists: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> Result<RegisterReport, StorageError> {
         let now = now_ms();
         self.write(move |txn| {
             let mut table = txn.open_table(T_CHUNKS).map_err(dbe)?;
-            let mut report = Vec::with_capacity(items.len());
-            for (h, blob_size, path) in &items {
-                let existing: Option<ChunkMeta> = match table.get(h.as_slice()).map_err(dbe)? {
-                    Some(g) => {
-                        let bytes: &[u8] = g.value();
-                        Some(bincode::deserialize(bytes).map_err(ser)?)
-                    }
-                    None => None,
-                };
+            let mut report = RegisterReport::default();
+            for reg in &regs {
+                let present = blob_exists(&reg.on_disk_path);
+                let existing: Option<ChunkMeta> =
+                    match table.get(reg.hash.as_slice()).map_err(dbe)? {
+                        Some(g) => {
+                            let bytes: &[u8] = g.value();
+                            Some(bincode::deserialize(bytes).map_err(ser)?)
+                        }
+                        None => None,
+                    };
+                if !present {
+                    // No row is written for a blob that vanished; the
+                    // uploader re-writes (CAS is idempotent) and retries.
+                    report.rejected_missing_blob.push(reg.hash);
+                    continue;
+                }
                 match existing {
                     Some(mut meta) => {
                         meta.refcount += 1;
                         let enc = bincode::serialize(&meta).map_err(ser)?;
-                        table.insert(h.as_slice(), enc.as_slice()).map_err(dbe)?;
-                        report.push(true);
+                        table
+                            .insert(reg.hash.as_slice(), enc.as_slice())
+                            .map_err(dbe)?;
+                        report.dedup_hit.push(reg.hash);
                     }
                     None => {
                         let meta = ChunkMeta {
                             refcount: 1,
-                            blob_size: *blob_size,
+                            blob_size: reg.size_stored,
                             created_at_ms: now,
-                            on_disk_path: path.clone(),
+                            on_disk_path: reg.on_disk_path.clone(),
                         };
                         let enc = bincode::serialize(&meta).map_err(ser)?;
-                        table.insert(h.as_slice(), enc.as_slice()).map_err(dbe)?;
-                        report.push(false);
+                        table
+                            .insert(reg.hash.as_slice(), enc.as_slice())
+                            .map_err(dbe)?;
+                        report.fresh.push(reg.hash);
                     }
                 }
             }
@@ -234,8 +290,157 @@ impl IndexDb {
         .await
     }
 
+    /// C-03 (H-01): single-chunk variant of [`register_chunks_verified`] so
+    /// the streaming pipeline can register each chunk while it still holds
+    /// the compressed bytes.
+    pub async fn register_chunk_verified(
+        &self,
+        reg: ChunkRegistration,
+        blob_exists: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> Result<RegisterOne, StorageError> {
+        let report = self
+            .register_chunks_verified(vec![reg], blob_exists)
+            .await?;
+        if !report.rejected_missing_blob.is_empty() {
+            return Ok(RegisterOne::RejectedMissingBlob);
+        }
+        if !report.dedup_hit.is_empty() {
+            return Ok(RegisterOne::DedupHit);
+        }
+        Ok(RegisterOne::Fresh)
+    }
+
+    /// C-03 guard (a): true when the chunk row exists with refcount > 0 —
+    /// an upload re-registered this chunk since the victim list was built.
+    pub async fn chunk_is_referenced(&self, hash: &[u8; 32]) -> Result<bool, StorageError> {
+        let h = *hash;
+        self.read(move |txn| {
+            let table = txn.open_table(T_CHUNKS).map_err(dbe)?;
+            match table.get(h.as_slice()).map_err(dbe)? {
+                Some(g) => {
+                    let meta: ChunkMeta = bincode::deserialize(g.value()).map_err(ser)?;
+                    Ok(meta.refcount > 0)
+                }
+                None => Ok(false),
+            }
+        })
+        .await
+    }
+
+    /// C-03 guard (c): removes the chunk row ONLY if it is still
+    /// unreferenced, inside one write transaction. Returns true when the
+    /// row was removed.
+    pub async fn finalize_sweep(&self, hash: &[u8; 32]) -> Result<bool, StorageError> {
+        let h = *hash;
+        self.write(move |txn| {
+            let mut table = txn.open_table(T_CHUNKS).map_err(dbe)?;
+            let existing: Option<ChunkMeta> = match table.get(h.as_slice()).map_err(dbe)? {
+                Some(g) => {
+                    let bytes: &[u8] = g.value();
+                    Some(bincode::deserialize(bytes).map_err(ser)?)
+                }
+                None => None,
+            };
+            match existing {
+                Some(meta) if meta.refcount == 0 => {
+                    table.remove(h.as_slice()).map_err(dbe)?;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        })
+        .await
+    }
+
+    /// M-01: streams every manifest's chunk hashes into `into`. Batched
+    /// reads keep peak memory at the referenced-set size.
+    pub async fn collect_referenced_hashes(
+        &self,
+        into: &mut std::collections::HashSet<[u8; 32]>,
+    ) -> Result<(), StorageError> {
+        let manifests = self.all_manifests().await?;
+        for m in manifests {
+            for c in &m.chunks {
+                into.insert(c.hash);
+            }
+        }
+        Ok(())
+    }
+
+    /// M-01: tombstones chunk rows with `refcount > 0` but ZERO manifest
+    /// references. Rule 16: the authoritative decision is made INSIDE one
+    /// `Durability::Immediate` write transaction that re-walks every
+    /// manifest — a manifest committed between the caller's
+    /// `collect_referenced_hashes` snapshot and this call makes its chunks
+    /// referenced again, and the in-txn re-check sees it (defends against
+    /// the C-03 race pattern). `referenced` is the caller's advisory
+    /// snapshot used for reporting; tombstoning never deletes blobs (the
+    /// normal sweep reclaims refcount-0 rows afterwards).
+    ///
+    /// Returns the tombstoned hashes (count = `len()`); the caller feeds
+    /// them into the C-03-safe victim sweep for reclamation.
+    pub async fn tombstone_unreferenced_chunks(
+        &self,
+        referenced: &std::collections::HashSet<[u8; 32]>,
+    ) -> Result<Vec<[u8; 32]>, StorageError> {
+        let advisory = referenced.len();
+        let _ = advisory;
+        self.write(move |txn| {
+            // In-txn authoritative referenced set.
+            let mut live: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+            {
+                let files = txn.open_table(T_FILES).map_err(dbe)?;
+                for row in files.iter().map_err(dbe)? {
+                    let (_, v) = row.map_err(dbe)?;
+                    let bytes: &[u8] = v.value();
+                    let m: Manifest = rmp_serde::from_slice(bytes).map_err(ser)?;
+                    for c in &m.chunks {
+                        live.insert(c.hash);
+                    }
+                }
+            }
+            let mut tombstoned: Vec<[u8; 32]> = Vec::new();
+            let mut rows: Vec<(Vec<u8>, ChunkMeta)> = Vec::new();
+            {
+                let chunks = txn.open_table(T_CHUNKS).map_err(dbe)?;
+                for row in chunks.iter().map_err(dbe)? {
+                    let (k, v) = row.map_err(dbe)?;
+                    let key = k.value().to_vec();
+                    let meta: ChunkMeta = bincode::deserialize(v.value()).map_err(ser)?;
+                    if meta.refcount > 0 {
+                        rows.push((key, meta));
+                    }
+                }
+            }
+            {
+                let mut chunks = txn.open_table(T_CHUNKS).map_err(dbe)?;
+                for (key, mut meta) in rows {
+                    let mut arr = [0u8; 32];
+                    if key.len() == 32 {
+                        arr.copy_from_slice(&key);
+                    } else {
+                        continue;
+                    }
+                    if live.contains(&arr) {
+                        continue; // referenced by a manifest — untouched
+                    }
+                    meta.refcount = 0;
+                    let enc = bincode::serialize(&meta).map_err(ser)?;
+                    chunks.insert(key.as_slice(), enc.as_slice()).map_err(dbe)?;
+                    tombstoned.push(arr);
+                }
+            }
+            Ok(tombstoned)
+        })
+        .await
+    }
+
     /// Replica-side insert: creates metadata only when absent, never bumps
     /// refcounts (replicas use reachability GC).
+    ///
+    /// NOTE(audit C-02): the row's refcount STAYS 0 by construction.
+    /// Refcount GC must never run on replicas — purge propagation is
+    /// metadata-only and reclamation is reachability-based.
     pub async fn upsert_chunk_replica(
         &self,
         hash: &[u8; 32],
@@ -265,6 +470,10 @@ impl IndexDb {
 
     /// Decrements refcounts; returns hashes whose refcount reached zero and
     /// whose metadata was removed (their blobs are now garbage).
+    /// Decrements refcounts, keeping rows that reach 0 (C-03): the GC sweep
+    /// helper re-checks reference status and unlinks the blob BEFORE the row
+    /// is removed via [`finalize_sweep`]. Returns the hashes whose refcount
+    /// reached 0 (sweep candidates).
     pub async fn decr_refcounts(&self, hashes: &[[u8; 32]]) -> Result<Vec<[u8; 32]>, StorageError> {
         let hashes = hashes.to_vec();
         self.write(move |txn| {
@@ -284,8 +493,11 @@ impl IndexDb {
                         let enc = bincode::serialize(&meta).map_err(ser)?;
                         table.insert(h.as_slice(), enc.as_slice()).map_err(dbe)?;
                     }
-                    Some(_) => {
-                        table.remove(h.as_slice()).map_err(dbe)?;
+                    Some(mut meta) => {
+                        // keep the row at refcount 0; finalize_sweep removes it
+                        meta.refcount = 0;
+                        let enc = bincode::serialize(&meta).map_err(ser)?;
+                        table.insert(h.as_slice(), enc.as_slice()).map_err(dbe)?;
                         zeroed.push(*h);
                     }
                     None => {}
@@ -530,6 +742,54 @@ impl IndexDb {
             Ok(out)
         })
         .await
+    }
+
+    /// M-04d: THE one list/count implementation both transports call.
+    ///
+    /// Tag filter takes precedence (exact match, unpaginated result set);
+    /// name filter is an exact match; unfiltered lists are paginated with
+    /// an exact tenant-wide count. REST and gRPC previously ran two
+    /// different code paths here (the audit's M-04d drift); they now share
+    /// this method, so their `total` values cannot diverge.
+    ///
+    /// Returns `(page_manifests, total)` where `total` is the exact number
+    /// of matching files for the request's filter — independent of the
+    /// page window.
+    pub async fn list_filtered(
+        &self,
+        tenant: &Uuid,
+        tag: Option<&str>,
+        name: Option<&str>,
+        include_deleted: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<Manifest>, u64), StorageError> {
+        if let Some(tag) = tag.map(str::trim).filter(|t| !t.is_empty()) {
+            let ids = self.list_ids_by_tag(tenant, tag).await?;
+            let mut out = Vec::new();
+            for id in ids {
+                if let Some(m) = self.get_manifest(&id).await? {
+                    if include_deleted || !m.is_deleted() {
+                        out.push(m);
+                    }
+                }
+            }
+            let total = out.len() as u64;
+            Ok((out, total))
+        } else if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) {
+            let out: Vec<Manifest> = match self.get_by_name(tenant, name).await? {
+                Some(m) if include_deleted || !m.is_deleted() => vec![m],
+                _ => Vec::new(),
+            };
+            let total = out.len() as u64;
+            Ok((out, total))
+        } else {
+            let list = self
+                .list_by_tenant(tenant, include_deleted, limit, offset)
+                .await?;
+            let total = self.count_by_tenant(tenant, include_deleted).await?;
+            Ok((list, total))
+        }
     }
 
     /// Counts a tenant's files (used for `total` in list responses).
@@ -859,36 +1119,113 @@ mod tests {
     #[tokio::test]
     async fn chunk_upsert_and_refcounts() {
         let (idx, _dir) = open();
-        let h = [3u8; 32];
-        let meta = ChunkMeta {
-            refcount: 1,
-            blob_size: 10,
-            created_at_ms: 0,
-            on_disk_path: "ab/cd.bin".into(),
+        let h = [1u8; 32];
+        let reg = ChunkRegistration {
+            hash: h,
+            size_stored: 42,
+            on_disk_path: "p/x.bin".into(),
         };
-        assert!(!idx.upsert_chunk(&h, meta.clone()).await.unwrap());
-        assert!(idx.upsert_chunk(&h, meta).await.unwrap());
-        let m = idx.get_chunk_meta(&h).await.unwrap().unwrap();
-        assert_eq!(m.refcount, 2);
-        assert_eq!(idx.decr_refcounts(&[h]).await.unwrap().len(), 0);
-        let zeroed = idx.decr_refcounts(&[h]).await.unwrap();
-        assert_eq!(zeroed.len(), 1);
+        // fresh registration
+        let one = idx
+            .register_chunk_verified(reg.clone(), |_| true)
+            .await
+            .unwrap();
+        assert_eq!(one, RegisterOne::Fresh);
+        // dedup hit
+        let two = idx.register_chunk_verified(reg, |_| true).await.unwrap();
+        assert_eq!(two, RegisterOne::DedupHit);
+        let meta = idx.get_chunk_meta(&h).await.unwrap().unwrap();
+        assert_eq!(meta.refcount, 2);
+        // first decr: refcount 1
+        assert!(idx.decr_refcounts(&[h]).await.unwrap().is_empty());
+        // second decr: reaches 0 — C-03 keeps the ROW (sweep finalizes it)
+        assert_eq!(idx.decr_refcounts(&[h]).await.unwrap(), vec![h]);
+        let meta = idx.get_chunk_meta(&h).await.unwrap().unwrap();
+        assert_eq!(meta.refcount, 0);
+        assert!(!idx.chunk_is_referenced(&h).await.unwrap());
+        assert!(idx.finalize_sweep(&h).await.unwrap());
         assert!(idx.get_chunk_meta(&h).await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn batch_upsert_reports_dedup() {
+    async fn verified_register_reports_dedup_and_rejects_missing() {
         let (idx, _dir) = open();
-        let items: Vec<([u8; 32], u64, String)> = (0..4u8)
-            .map(|i| ([i; 32], 100 + i as u64, format!("p/{i}.bin")))
+        let regs: Vec<ChunkRegistration> = (0..4u8)
+            .map(|i| ChunkRegistration {
+                hash: [i; 32],
+                size_stored: 100 + i as u64,
+                on_disk_path: format!("p/{i}.bin"),
+            })
             .collect();
-        let r1 = idx.register_chunks(items.clone()).await.unwrap();
-        assert!(r1.iter().all(|hit| !*hit));
-        let r2 = idx.register_chunks(items).await.unwrap();
-        assert!(r2.iter().all(|hit| *hit));
+        let r1 = idx
+            .register_chunks_verified(regs.clone(), |_| true)
+            .await
+            .unwrap();
+        assert_eq!(r1.fresh.len(), 4);
+        assert!(r1.dedup_hit.is_empty());
+        let r2 = idx
+            .register_chunks_verified(regs.clone(), |_| true)
+            .await
+            .unwrap();
+        assert_eq!(r2.dedup_hit.len(), 4);
         let (count, bytes) = idx.chunk_stats().await.unwrap();
         assert_eq!(count, 4);
         assert_eq!(bytes, 100 + 101 + 102 + 103);
+
+        // Missing blob: no row written, hash reported rejected.
+        let missing = ChunkRegistration {
+            hash: [9; 32],
+            size_stored: 10,
+            on_disk_path: "p/missing.bin".into(),
+        };
+        let r3 = idx
+            .register_chunks_verified(vec![missing], |_| false)
+            .await
+            .unwrap();
+        assert_eq!(r3.rejected_missing_blob, vec![[9u8; 32]]);
+        assert!(idx.get_chunk_meta(&[9; 32]).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn fused_register_rejects_missing_blob() {
+        let (idx, _dir) = open();
+        let reg = ChunkRegistration {
+            hash: [8; 32],
+            size_stored: 10,
+            on_disk_path: "p/gone.bin".into(),
+        };
+        let out = idx
+            .register_chunk_verified(reg.clone(), |_| false)
+            .await
+            .unwrap();
+        assert_eq!(out, RegisterOne::RejectedMissingBlob);
+        assert!(idx.get_chunk_meta(&reg.hash).await.unwrap().is_none());
+        // refcounts untouched
+        assert!(!idx.chunk_is_referenced(&reg.hash).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn finalize_sweep_only_removes_unreferenced() {
+        let (idx, _dir) = open();
+        let h = [7u8; 32];
+        let reg = ChunkRegistration {
+            hash: h,
+            size_stored: 10,
+            on_disk_path: "p/x.bin".into(),
+        };
+        idx.register_chunks_verified(vec![reg.clone()], |_| true)
+            .await
+            .unwrap();
+        // referenced: finalize refuses
+        assert!(idx.chunk_is_referenced(&h).await.unwrap());
+        assert!(!idx.finalize_sweep(&h).await.unwrap());
+        assert!(idx.get_chunk_meta(&h).await.unwrap().is_some());
+        // decr to zero (row stays), finalize now removes
+        let zeroed = idx.decr_refcounts(&[h]).await.unwrap();
+        assert_eq!(zeroed, vec![h]);
+        assert!(!idx.chunk_is_referenced(&h).await.unwrap());
+        assert!(idx.finalize_sweep(&h).await.unwrap());
+        assert!(idx.get_chunk_meta(&h).await.unwrap().is_none());
     }
 
     #[tokio::test]

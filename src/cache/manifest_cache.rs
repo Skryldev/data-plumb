@@ -15,9 +15,17 @@ pub struct ManifestCache {
 }
 
 impl ManifestCache {
+    /// H-01 (audit §3.6): the L3 weigher is BYTE-based — a 131k-chunk
+    /// manifest is ~13 MB and 10k such entries must not allocate 1.3 GB of
+    /// cache. `manifest_capacity` is retained for configuration
+    /// compatibility but is superseded by `manifest_max_bytes`.
     pub fn new(cfg: &CacheConfig) -> Self {
         let inner = Cache::builder()
-            .max_capacity(cfg.manifest_capacity.max(1))
+            .max_capacity(cfg.manifest_max_bytes.max(1))
+            .weigher(|_k: &Uuid, v: &Arc<Manifest>| {
+                // Approximation acceptable per audit: header + per-chunk cost.
+                (64u32.saturating_add(v.chunks.len().saturating_mul(96) as u32)).max(1)
+            })
             .time_to_live(Duration::from_secs(cfg.manifest_ttl_secs.max(1)))
             .build();
         Self { inner }
@@ -47,6 +55,12 @@ impl ManifestCache {
         }
     }
 
+    /// H-01: runs moka's pending maintenance (eviction is deferred); used
+    /// by tests and diagnostics to observe the effective byte bound.
+    pub async fn maintain(&self) {
+        self.inner.run_pending_tasks().await;
+    }
+
     pub async fn invalidate(&self, id: &Uuid) {
         self.inner.invalidate(id).await;
     }
@@ -70,6 +84,7 @@ mod tests {
             l2_max_bytes: 1,
             l2_ttl_secs: 1,
             manifest_capacity: 100,
+            manifest_max_bytes: 64 * 1024 * 1024,
             manifest_ttl_secs: 60,
         }
     }

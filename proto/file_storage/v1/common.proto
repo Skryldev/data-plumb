@@ -77,6 +77,13 @@ message Manifest {
 
   // Monotonically increasing version, incremented on each update.
   uint64 version = 13;
+
+  // M-04c: true when the `chunks` list above was capped at 1000 entries
+  // for this response (hostile/oversized manifests cannot OOM handlers).
+  // The authoritative chunk count is `chunk`-sum of size metadata; use
+  // GetManifest paging (or the REST meta endpoint) for the full list.
+  // Additive wire change (V5 Wave 2); replication responses never set it.
+  bool chunks_truncated = 14;
 }
 
 // A tenant record. `quota_bytes` is reserved for future use and is always

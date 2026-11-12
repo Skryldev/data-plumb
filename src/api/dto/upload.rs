@@ -9,6 +9,11 @@ pub struct UploadQuery {
     pub name: Option<String>,
     pub tags: Option<String>,
     pub mime: Option<String>,
+    /// M-04e: optional client-declared content size, capped at
+    /// `limits.max_file_size` by the same shared validation code the gRPC
+    /// `UploadHeader.expected_size` uses. `0` / absent means "unknown".
+    #[serde(default)]
+    pub expected_size: Option<u64>,
 }
 
 impl UploadQuery {

@@ -7,6 +7,7 @@
 - [Data Flow](./architecture/data-flow.md)
 - [Storage Layout](./architecture/storage-layout.md)
 - [Chunking & Dedup](./architecture/chunking.md)
+- [Request Validation Contract](./architecture/validation.md)
 - [Caching](./architecture/caching.md)
 - [Replication](./architecture/replication.md)
 - [Garbage Collection](./architecture/gc.md)
@@ -52,14 +53,18 @@
 - [Tenants](./security/tenants.md)
 - [Audit Log](./security/audit.md)
 - [Hardening Checklist](./security/hardening.md)
+- [Throttling & Rate Limits](./security/throttling.md)
 
 # Operations
+- [Bootstrap & Secrets](./operations/bootstrap.md)
 - [Monitoring](./operations/monitoring.md)
 - [Backup & Restore](./operations/backup-restore.md)
 - [GC Operations](./operations/gc-operations.md)
 - [Replication Ops](./operations/replication-ops.md)
 - [Troubleshooting](./operations/troubleshooting.md)
 - [Runbook](./operations/runbook.md)
+- [CI](./operations/ci.md)
+- [Wave 2 Report](./operations/wave2-report.md)
 
 # Integration
 - [Rust Client](./integration/rust-client.md)

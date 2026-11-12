@@ -5,9 +5,11 @@ use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::routing::{delete, get, post};
 use axum::Router;
+use tower_http::catch_panic::CatchPanicLayer;
 
 use crate::api::handlers;
 use crate::api::middleware as mw;
+use crate::config;
 use crate::state::AppState;
 
 pub fn build_router(state: AppState) -> Router {
@@ -68,15 +70,37 @@ pub fn build_router(state: AppState) -> Router {
 
     let (set_request_id, propagate_request_id) = mw::request_id::build_request_id_layers();
 
+    // H-05/M-17: /metrics exposure is an explicit, default-safe choice.
+    // Loopback (default): only loopback peers. ApiKey: constant-time check.
+    // Public: today's behavior + startup warning (logged at boot).
+    let metrics_route = match state.0.cfg.metrics.exposure {
+        config::MetricsExposure::Loopback => get(handlers::metrics::metrics).route_layer(
+            middleware::from_fn_with_state(state.clone(), mw::metrics_guard::loopback_only),
+        ),
+        config::MetricsExposure::ApiKey => get(handlers::metrics::metrics).route_layer(
+            middleware::from_fn_with_state(state.clone(), mw::metrics_guard::api_key_only),
+        ),
+        config::MetricsExposure::Public => {
+            tracing::warn!(
+                "metrics.exposure=public: /metrics is served WITHOUT authentication;                  this exposes operational metadata (tenant scale, routes, codes)"
+            );
+            get(handlers::metrics::metrics)
+        }
+    };
+
     Router::new()
         .route("/health", get(handlers::health::health))
         .route("/ready", get(handlers::health::ready))
-        .route("/metrics", get(handlers::metrics::metrics))
+        .route("/metrics", metrics_route)
         .nest("/internal", internal)
         .nest("/api/v1", api_v1)
         .layer(middleware::from_fn(mw::request_id::metrics_middleware))
         .layer(propagate_request_id)
         .layer(set_request_id)
+        // H-04: a handler panic yields the standard error envelope (500,
+        // code internal_error) instead of a connection reset; the panic
+        // payload is never leaked.
+        .layer(CatchPanicLayer::custom(mw::request_id::panic_to_500))
         .layer(DefaultBodyLimit::max(state.0.cfg.limits.max_body))
         .with_state(state)
 }

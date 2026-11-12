@@ -201,6 +201,14 @@ impl ReplicationService for ReplicationServiceImpl {
 
 /// Applies one PutChunk op (mirrors `/internal/chunk` semantics).
 async fn apply_put_chunk(state: &AppState, put: pb::PutChunk) -> Result<(), StorageError> {
+    // H-04: verify peer metadata against the actual bytes before persisting.
+    if put.size_stored != put.data.len() as u64 {
+        return Err(StorageError::Corruption(format!(
+            "put_chunk: peer size_stored {} != blob len {}",
+            put.size_stored,
+            put.data.len()
+        )));
+    }
     let hash: [u8; 32] = put
         .hash
         .as_slice()
@@ -264,30 +272,32 @@ async fn apply_put_manifest(state: &AppState, put: pb::PutManifest) -> Result<()
 
 /// Applies a DeleteFile op: hard purge (`purge=true`) or soft-delete
 /// marker propagation.
+///
+/// NOTE(audit C-02): replica deletes are METADATA-ONLY. Replica chunks
+/// carry refcount 0 by construction (`upsert_chunk_replica`), so touching
+/// refcounts or blobs here destroyed blobs other live files still
+/// referenced. Reachability GC reclaims blobs once no manifest references
+/// them. Refcounts are a PRIMARY-only concept.
 async fn apply_delete_file(state: &AppState, del: pb::DeleteFile) -> Result<(), StorageError> {
     let file_id = crate::grpc::convert::uuid_from_str(&del.file_id, "file_id")?;
     if del.purge {
-        let manifest = state
-            .0
-            .index
-            .get_manifest(&file_id)
-            .await?
-            .ok_or_else(|| StorageError::NotFound(format!("file {file_id}")))?;
-        let hashes: Vec<[u8; 32]> = manifest.chunks.iter().map(|c| c.hash).collect();
-        state.0.index.remove_manifest(&file_id).await?;
-        state.0.cache.manifests.invalidate(&file_id).await;
-        let zeroed = state.0.index.decr_refcounts(&hashes).await?;
-        for h in &zeroed {
-            state.0.blocks.delete(h).await?;
+        // Mirrors DELETE /internal/manifest/:id exactly: remove the
+        // manifest row, invalidate the cache, touch nothing else.
+        if state.0.index.remove_manifest(&file_id).await?.is_some() {
+            state.0.cache.manifests.invalidate(&file_id).await;
+            metrics::record_replication_applied(1);
         }
     } else {
-        state
+        if state
             .0
             .index
             .soft_delete_manifest(&file_id)
             .await?
-            .ok_or_else(|| StorageError::NotFound(format!("file {file_id}")))?;
-        state.0.cache.manifests.invalidate(&file_id).await;
+            .is_some()
+        {
+            state.0.cache.manifests.invalidate(&file_id).await;
+            metrics::record_replication_applied(1);
+        }
     }
     Ok(())
 }

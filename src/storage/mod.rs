@@ -3,4 +3,5 @@
 pub mod block_store;
 pub mod index_db;
 pub mod manifest;
+pub mod quarantine;
 pub mod retrieval;

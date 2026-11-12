@@ -56,8 +56,15 @@ message TriggerGCRequest {
   }
   // Defaults to the configured mode.
   Mode mode = 1;
-  // Count what would be removed without deleting anything.
+  // Count what would be removed without deleting anything. With
+  // `reconcile=true`, dry_run runs the read-only reconcile report
+  // (rule 16: dry-run never deletes); without reconcile it is still
+  // reported as unimplemented for plain sweep passes.
   bool dry_run = 2;
+  // M-01: run the drift-reconciliation pass instead of a plain sweep:
+  // tombstone chunk rows with refcount > 0 but zero manifest references
+  // (in-transaction re-verified), then let the normal sweep reclaim them.
+  bool reconcile = 3;
 }
 
 message GCResult {
@@ -65,6 +72,14 @@ message GCResult {
   uint64 chunks_removed = 2;
   uint64 orphans_removed = 3;
   uint64 bytes_reclaimed = 4;
+
+  // M-01 reconcile report (zero when reconcile=false; additive wire).
+  uint64 scanned_blobs = 5;
+  uint64 referenced_chunks = 6;
+  uint64 orphan_chunks = 7;
+  uint64 phantom_manifests = 8;
+  uint64 tombstoned = 9;
+  uint64 reclaimed = 10;
 }
 
 message ResyncRequest {

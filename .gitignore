@@ -1,7 +1,4 @@
-/target
-/data
-*.redb
-*.key
-Cargo.lock.bak
-.idea
-.vscode
+target/
+data/
+secrets/file-storage.yaml
+secrets/*.local.yaml

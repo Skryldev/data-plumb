@@ -59,7 +59,32 @@ impl ChunkCache {
             return Ok(b);
         }
         let loaded = self.blob.try_get_with(key, loader()).await.map_err(|arc| {
-            crate::error::StorageError::Internal(format!("blob load failed: {arc}"))
+            // moka hands the error back as Arc<E>; reconstruct the semantic
+            // variant so caller-facing mappings stay intact (M-07: a repair
+            // verification failure must surface as Corruption, not Internal;
+            // missing blobs must stay NotFound). Anything without a cheap
+            // clone keeps the legacy Internal wrap.
+            match &*arc {
+                crate::error::StorageError::NotFound(m) => {
+                    crate::error::StorageError::NotFound(m.clone())
+                }
+                crate::error::StorageError::Corruption(m) => {
+                    crate::error::StorageError::Corruption(m.clone())
+                }
+                crate::error::StorageError::TooLarge(m) => {
+                    crate::error::StorageError::TooLarge(m.clone())
+                }
+                crate::error::StorageError::Validation(m) => {
+                    crate::error::StorageError::Validation(m.clone())
+                }
+                crate::error::StorageError::Unavailable(m) => {
+                    crate::error::StorageError::Unavailable(m.clone())
+                }
+                crate::error::StorageError::Encryption(m) => {
+                    crate::error::StorageError::Encryption(m.clone())
+                }
+                other => crate::error::StorageError::Internal(format!("blob load failed: {other}")),
+            }
         })?;
         Ok(loaded)
     }
@@ -101,6 +126,7 @@ mod tests {
             l2_max_bytes: 1024,
             l2_ttl_secs: 60,
             manifest_capacity: 100,
+            manifest_max_bytes: 64 * 1024 * 1024,
             manifest_ttl_secs: 60,
         }
     }

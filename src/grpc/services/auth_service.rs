@@ -71,6 +71,24 @@ impl AuthService for AuthServiceImpl {
                     .await;
                 Ok(Response::new(to_response(pair)))
             }
+            Err(e @ crate::error::StorageError::Throttled(_)) => {
+                // M-05: lockout events are audited distinctly from plain
+                // credential failures, carrying the retry window.
+                self.state
+                    .0
+                    .audit
+                    .record(
+                        AuditAction::LoginThrottled,
+                        Actor::User(username.clone()),
+                        None,
+                        &username,
+                        "",
+                        "throttled",
+                        &format!("grpc {}", e),
+                    )
+                    .await;
+                Err(status_from_error(&e))
+            }
             Err(e) => {
                 self.state
                     .0

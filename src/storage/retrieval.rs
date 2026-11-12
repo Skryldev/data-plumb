@@ -1,5 +1,14 @@
 //! Read path: L1 (plaintext) → L2 (blob) → disk, BLAKE3 verification after
 //! disk loads, N-chunk read-ahead prefetch, full and range retrieval.
+//!
+//! M-07: the replica repair path is **verify-then-persist** — bytes from
+//! an upstream are UNTRUSTED until the decrypted+decompressed plaintext
+//! hashes to the chunk reference's `plain_hash`. Only then do they land
+//! in the CAS blob store / L2. Hostile bytes are quarantined, the L2
+//! entry invalidated, the alarm metric ticked and a `tracing::error!`
+//! emitted. Replicas WITHOUT the tenant key (ciphertext-only posture) keep
+//! the legacy order with a loud warn + dedicated metric — documented in
+//! `docs/security/threat-model.md`.
 
 use bytes::Bytes;
 use futures::Stream;
@@ -18,6 +27,7 @@ use crate::security::encryption::Encryptor;
 use crate::storage::block_store::BlockStore;
 use crate::storage::index_db::IndexDb;
 use crate::storage::manifest::{ChunkRef, Manifest};
+use crate::storage::quarantine::Quarantine;
 
 /// How long a read-ahead task may linger in the background.
 const PREFETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -33,6 +43,7 @@ pub struct RetrievalEngine {
     compressor: Arc<Compressor>,
     encryptor: Option<Arc<Encryptor>>,
     replicator: Arc<Replicator>,
+    quarantine: Arc<Quarantine>,
     read_ahead: usize,
 }
 
@@ -44,8 +55,12 @@ impl RetrievalEngine {
         compressor: Arc<Compressor>,
         encryptor: Option<Arc<Encryptor>>,
         replicator: Arc<Replicator>,
-        _cfg: &AppConfig,
+        cfg: &AppConfig,
     ) -> Self {
+        let quarantine = Arc::new(Quarantine::new(
+            cfg.storage.quarantine_dir(),
+            cfg.storage.quarantine_max_bytes,
+        ));
         Self {
             index,
             blocks,
@@ -53,6 +68,7 @@ impl RetrievalEngine {
             compressor,
             encryptor,
             replicator,
+            quarantine,
             read_ahead: READ_AHEAD,
         }
     }
@@ -128,29 +144,26 @@ impl RetrievalEngine {
             metrics::record_cache_hit("l1");
             return Ok(b);
         }
+        let engine = self.clone();
+        let cr_owned = cr.clone();
+        let tenant_owned = *tenant;
         let blob = self
             .cache
             .chunks
-            .get_or_load_blob(cr.hash, || {
-                let blocks = self.blocks.clone();
-                let hash = cr.hash;
-                let replicator = self.replicator.clone();
-                async move {
-                    match blocks.read(&hash).await {
-                        Ok(b) => Ok(b),
-                        Err(e @ StorageError::NotFound(_)) => {
-                            // Replica on-miss repair: pull the blob from the
-                            // upstream primary when configured.
-                            if replicator.has_upstream() {
-                                let blob = replicator.fetch_blob(&hash).await?;
-                                blocks.write(&hash, &blob).await?;
-                                Ok(blob)
-                            } else {
-                                Err(e)
-                            }
+            .get_or_load_blob(cr.hash, move || async move {
+                match engine.blocks.read(&cr_owned.hash).await {
+                    Ok(b) => Ok(b),
+                    Err(e @ StorageError::NotFound(_)) => {
+                        // Replica on-miss repair: pull the blob from the
+                        // upstream primary when configured. M-07: the
+                        // bytes are verified BEFORE they are persisted.
+                        if engine.replicator.has_upstream() {
+                            engine.repair_chunk(&tenant_owned, &cr_owned).await
+                        } else {
+                            Err(e)
                         }
-                        Err(other) => Err(other),
                     }
+                    Err(other) => Err(other),
                 }
             })
             .await?;
@@ -162,6 +175,86 @@ impl RetrievalEngine {
         }
         self.cache.chunks.put_plain(cr.hash, plain.clone()).await;
         Ok(plain)
+    }
+
+    /// M-07: fetch-and-verify repair. Bytes fetched from the upstream are
+    /// UNTRUSTED. When content verification is possible (plaintext chunk,
+    /// or an encrypted chunk on a node holding the tenant key) the bytes
+    /// are decoded-for-verify and hashed BEFORE anything is persisted.
+    /// On mismatch: quarantine, L2 invalidation, alarm metric, error log,
+    /// and `StorageError::Corruption` to the caller. Nothing lands in the
+    /// CAS or the cache.
+    async fn repair_chunk(&self, tenant: &Uuid, cr: &ChunkRef) -> Result<Bytes, StorageError> {
+        // 1. Fetch bytes from upstream. UNTRUSTED until verified.
+        let blob = self.replicator.fetch_blob(&cr.hash).await?;
+
+        // 2. Can we verify? Plaintext chunks always; encrypted chunks only
+        //    when this node holds the tenant key (encryption enabled).
+        let keyed = !cr.encrypted || self.encryptor.is_some();
+        if !keyed {
+            // Ciphertext-only posture: legacy order (persist-then-hope),
+            // documented as degraded in docs/security/threat-model.md.
+            metrics::record_repair_ciphertext_only();
+            tracing::warn!(
+                chunk_hash = %hex::encode(cr.hash),
+                peer = %self.replicator.upstream_url().unwrap_or_default(),
+                "repair without tenant key — verify-skipped (degraded posture)"
+            );
+            self.blocks.write(&cr.hash, &blob).await?;
+            return Ok(blob);
+        }
+
+        // 3. Verify before persist: decrypt (bounded decompress via the
+        //    H-04 clamp inside the compressor) and hash the plaintext.
+        let verified = match self.decode(tenant, cr, &blob).await {
+            Err(e) => {
+                // Undecodable bytes are unverifiable bytes — never persist.
+                tracing::error!(
+                    chunk_hash = %hex::encode(cr.hash),
+                    peer = %self.replicator.upstream_url().unwrap_or_default(),
+                    error = %e,
+                    "repair verification failed (undecodable); hostile bytes quarantined"
+                );
+                self.quarantine_hostile(cr.hash, &blob).await;
+                return Err(StorageError::Corruption(format!(
+                    "repair verification failed for chunk {}: undecodable upstream bytes",
+                    hex::encode(cr.hash)
+                )));
+            }
+            Ok(plain) => plain,
+        };
+        if verify(&verified, &cr.plain_hash, "chunk").is_err() {
+            // 4. Hostile bytes: quarantine, invalidate, alarm, refuse.
+            self.quarantine_hostile(cr.hash, &blob).await;
+            self.cache.chunks.invalidate(&cr.hash).await;
+            metrics::record_repair_hash_mismatch();
+            tracing::error!(
+                chunk_hash = %hex::encode(cr.hash),
+                peer = %self.replicator.upstream_url().unwrap_or_default(),
+                "repair verification failed; hostile bytes quarantined"
+            );
+            return Err(StorageError::Corruption(format!(
+                "repair verification failed for chunk {}",
+                hex::encode(cr.hash)
+            )));
+        }
+
+        // 5. Verified — persist the ORIGINAL stored-form bytes (not plain),
+        //    so the on-disk format stays consistent with the rest of the
+        //    store. The plaintext enters L1 via the normal load path.
+        self.blocks.write(&cr.hash, &blob).await?;
+        Ok(blob)
+    }
+
+    /// Best-effort quarantine write; never masks the Corruption error.
+    async fn quarantine_hostile(&self, hash: [u8; 32], blob: &[u8]) {
+        if let Err(e) = self.quarantine.store(&hash, blob).await {
+            tracing::error!(
+                chunk_hash = %hex::encode(hash),
+                error = %e,
+                "failed to quarantine hostile repair bytes"
+            );
+        }
     }
 
     /// decrypt + decompress according to chunk flags.
@@ -184,8 +277,7 @@ impl RetrievalEngine {
             Bytes::copy_from_slice(blob)
         };
         if cr.compressed {
-            self.compressor
-                .decompress(&raw, true, cr.size_original as usize)
+            self.compressor.decompress(&raw, true, cr.size_original)
         } else if raw.len() as u64 != cr.size_original {
             Err(StorageError::Corruption(format!(
                 "chunk size {} != expected {}",

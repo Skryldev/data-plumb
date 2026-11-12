@@ -1,11 +1,19 @@
+version: "3.9"
+
+# C-01: secrets come from the compose `secrets:` facility (git-ignored);
+# containers run as nonroot; ports bind to loopback — an edge proxy
+# terminates TLS. `cp secrets/file-storage.yaml.example secrets/file-storage.yaml`
+# and fill in operator-generated secrets before `docker compose up`.
+
 services:
   primary:
-    image: skryldev/data-plumb:1.2.1
+    build: .
+    image: file-storage:1.0.0
     container_name: fs-primary
-    user: "0:0"
+    user: "65532:65532"          # nonroot; NEVER "0:0"
     ports:
-      - "8080:8080"   # REST
-      - "9090:9090"   # gRPC
+      - "127.0.0.1:8080:8080"   # REST (loopback by default)
+      - "127.0.0.1:9090:9090"   # gRPC  (loopback by default)
     environment:
       FS_SERVER__PORT: "8080"
       FS_SERVER__GRPC_PORT: "9090"
@@ -15,22 +23,24 @@ services:
       FS_REPLICATION__ENABLED: "true"
       FS_REPLICATION__MODE: "async"
       FS_REPLICATION__TARGET_URL: "http://replica:8080"
-      FS_REPLICATION__API_KEY: "cluster-api-key-change-me"
+      FS_REPLICATION__ROLE: "primary"
       FS_LOGGING__FORMAT: "json"
       RUST_LOG: "info"
+    secrets:
+      - file-storage.yaml
     volumes:
       - fs_primary:/var/lib/file-storage/data
     restart: unless-stopped
 
   replica:
-    image: skryldev/data-plumb:1.2.1
+    image: file-storage:1.0.0
     container_name: fs-replica
-    user: "0:0"
+    user: "65532:65532"
     depends_on:
       - primary
     ports:
-      - "8081:8080"   # REST
-      - "9091:9090"   # gRPC
+      - "127.0.0.1:8081:8080"
+      - "127.0.0.1:9091:9090"
     environment:
       FS_SERVER__PORT: "8080"
       FS_SERVER__GRPC_PORT: "9090"
@@ -39,10 +49,12 @@ services:
       FS_ENCRYPTION__KEYS_DIR: "/var/lib/file-storage/data/keys"
       FS_REPLICATION__ENABLED: "false"
       FS_REPLICATION__UPSTREAM_URL: "http://primary:8080"
-      FS_REPLICATION__API_KEY: "cluster-api-key-change-me"
+      FS_REPLICATION__ROLE: "replica"
       FS_RETENTION__GC_MODE: "reachability"
       FS_LOGGING__FORMAT: "json"
       RUST_LOG: "info"
+    secrets:
+      - file-storage.yaml
     volumes:
       - fs_replica:/var/lib/file-storage/data
     restart: unless-stopped
@@ -54,15 +66,16 @@ services:
       - primary
       - replica
     ports:
-      - "9099:9090"   # host 9090 belongs to the gRPC listeners
+      - "127.0.0.1:9099:9090"   # host 9090 belongs to the gRPC listeners
     volumes:
       - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     restart: unless-stopped
 
+  # One-shot service discovery check (run: docker compose run --rm grpcurl).
   grpcurl:
     image: fullstorydev/grpcurl:v1.9.1
     profiles: ["grpc-test"]
-    entrypoint: ["/bin/grpcurl"]
+    entrypoint: ["/grpcurl"]
     command: ["-plaintext", "-max-time", "5", "primary:9090", "list"]
     depends_on:
       - primary
@@ -71,3 +84,7 @@ services:
 volumes:
   fs_primary:
   fs_replica:
+
+secrets:
+  file-storage.yaml:
+    file: ./secrets/file-storage.yaml

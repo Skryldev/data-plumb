@@ -2,6 +2,7 @@ target
 data
 .git
 tests
+benches
 *.md
 docker-compose.yml
 .cargo

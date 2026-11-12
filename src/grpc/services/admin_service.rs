@@ -103,11 +103,13 @@ impl AdminService for AdminServiceImpl {
         let ctx = context_from(&request)?;
         let req = request.into_inner();
 
-        // dry_run is reported as UNIMPLEMENTED rather than silently running
-        // a destructive pass the caller believes was a rehearsal.
-        if req.dry_run {
+        // M-01: reconcile passes honor dry_run (read-only report, rule 16).
+        // Plain sweep passes keep the UNIMPLEMENTED answer for dry_run
+        // rather than silently running a destructive pass the caller
+        // believes was a rehearsal.
+        if req.dry_run && !req.reconcile {
             return Err(Status::unimplemented(
-                "gc dry_run is not supported yet; run without dry_run",
+                "gc dry_run is only supported with reconcile=true; run without dry_run",
             ));
         }
         let mode = match req.mode {
@@ -116,6 +118,48 @@ impl AdminService for AdminServiceImpl {
             2 => Some(crate::config::GcMode::Reachability),
             other => return Err(Status::invalid_argument(format!("unknown gc mode {other}"))),
         };
+        if req.reconcile {
+            let rmode = if req.dry_run {
+                crate::gc::ReconcileMode::DryRun
+            } else {
+                crate::gc::ReconcileMode::Repair
+            };
+            let report = self
+                .state
+                .0
+                .gc
+                .reconcile(rmode)
+                .await
+                .map_err(|e| status_from_error(&e))?;
+            self.state
+                .0
+                .audit
+                .record(
+                    AuditAction::GcRun,
+                    Actor::User(ctx.username),
+                    None,
+                    "admin/gc",
+                    "",
+                    "ok",
+                    &format!(
+                        "grpc reconcile mode={rmode:?} orphans={} tombstoned={} reclaimed={}",
+                        report.orphan_chunks, report.tombstoned, report.reclaimed
+                    ),
+                )
+                .await;
+            return Ok(Response::new(pb::GcResult {
+                manifests_purged: 0,
+                chunks_removed: 0,
+                orphans_removed: 0,
+                bytes_reclaimed: 0,
+                scanned_blobs: report.scanned_blobs,
+                referenced_chunks: report.referenced_chunks,
+                orphan_chunks: report.orphan_chunks,
+                phantom_manifests: report.phantom_manifests,
+                tombstoned: report.tombstoned,
+                reclaimed: report.reclaimed,
+            }));
+        }
         let report = if let Some(mode) = mode {
             self.state
                 .0
@@ -155,6 +199,12 @@ impl AdminService for AdminServiceImpl {
             chunks_removed: report.chunks_removed,
             orphans_removed: report.orphans_removed,
             bytes_reclaimed: report.bytes_reclaimed,
+            scanned_blobs: 0,
+            referenced_chunks: 0,
+            orphan_chunks: 0,
+            phantom_manifests: 0,
+            tombstoned: 0,
+            reclaimed: 0,
         }))
     }
 

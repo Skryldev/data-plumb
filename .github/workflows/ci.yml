@@ -1,0 +1,189 @@
+name: ci
+on:
+  push: { branches: [main, 'release/*'] }
+  pull_request: {}
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy-test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+
+  # CI-W1 (V5 Wave 2): cross-platform gate. M-13 cfg-gates all unix-only
+  # code, so Windows builds cleanly; the platform-agnostic test subset
+  # runs natively (unix-perm tests are skipped by name).
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --target x86_64-pc-windows-msvc --all-targets
+      - run: cargo test --target x86_64-pc-windows-msvc -- --skip platform_unix
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install --locked cargo-audit cargo-deny
+      - run: cargo audit
+      - run: cargo deny check
+
+  proto:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bufbuild/buf-action@v1
+        with:
+          input: proto
+          lint: true
+          breaking: true
+
+  # CI rule `no-handler-validation` (M-04, V5 rule 15): validation lives
+  # in core::validation, never in a handler. Drift cannot re-enter
+  # silently.
+  no-handler-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/check_no_handler_validation.sh
+
+  # CI-W2 (V5 §7.2): the C-01 boot story proven live on every PR — the
+  # shipped (secretless) config MUST refuse to boot naming its violations,
+  # a secreted config MUST boot and serve /health, and the old bootstrap
+  # password MUST be rejected.
+  c01-boot-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bin file-storage
+      - name: shipped config MUST refuse to boot
+        run: |
+          set +e
+          ./target/release/file-storage --config config/production.yaml 2>&1 | tee /tmp/boot.txt
+          code=$?
+          set -e
+          test "$code" -ne 0 || { echo "C-01 VIOLATION: secretless config booted"; exit 1; }
+          grep -qiE "violation" /tmp/boot.txt || { echo "refusal must name its violations"; exit 1; }
+      - name: secreted config MUST boot and serve /health
+        run: |
+          cp secrets/file-storage.yaml.example /tmp/secretful.yaml
+          sed -i "s/PASTE_openssl_rand_hex_32_HERE/$(openssl rand -hex 32)/" /tmp/secretful.yaml
+          sed -i "s/PASTE_openssl_rand_hex_24_HERE/$(openssl rand -hex 24)/" /tmp/secretful.yaml
+          HASH=$(./target/release/file-storage hash-password --password bootstrap-admin-pw-1)
+          sed -i "s|PASTE_FILE_STORAGE_HASH_PASSWORD_OUTPUT_HERE|$HASH|" /tmp/secretful.yaml
+          ./target/release/file-storage --config /tmp/secretful.yaml &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/health && break || sleep 1; done
+          curl -sf http://127.0.0.1:8080/health > /dev/null || { echo "no /health"; exit 1; }
+          # admin123 (the C-01 shipped literal) MUST fail.
+          if curl -sf -X POST http://127.0.0.1:8080/api/v1/auth/login \
+              -H 'Content-Type: application/json' \
+              -d '{"username":"admin","password":"admin123"}' > /dev/null; then
+            echo "C-01 VIOLATION: admin123 authenticated"; exit 1
+          fi
+          kill -9 %1 2>/dev/null || true
+
+  # CI-W3 (V5 §7.3): binary-size regression guard. Baseline 12 MiB
+  # (post-Wave-1); fail past 15 MiB (25% growth). Size reported on the PR.
+  binary-size:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --target x86_64-unknown-linux-musl --bin file-storage
+      - id: size
+        run: |
+          SIZE=$(stat -c%s target/x86_64-unknown-linux-musl/release/file-storage)
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          if [ "$SIZE" -gt 15728640 ]; then
+            echo "FAIL: binary grew past 15 MiB (got $SIZE bytes)"
+            exit 1
+          fi
+      - uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body: `Binary size (musl release): ${{ steps.size.outputs.size }} bytes`
+            })
+
+  # CI-W5 (V5 §7.5): dashboard smoke — the series the Grafana dashboard
+  # and alert rules depend on must exist on a live stack.
+  dashboard-smoke:
+    runs-on: ubuntu-latest
+    needs: [clippy-test-linux]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bin file-storage
+      - name: boot secreted stack
+        run: |
+          cp secrets/file-storage.yaml.example /tmp/secretful.yaml
+          sed -i "s/PASTE_openssl_rand_hex_32_HERE/$(openssl rand -hex 32)/" /tmp/secretful.yaml
+          sed -i "s/PASTE_openssl_rand_hex_24_HERE/$(openssl rand -hex 24)/" /tmp/secretful.yaml
+          HASH=$(./target/release/file-storage hash-password --password bootstrap-admin-pw-1)
+          sed -i "s|PASTE_FILE_STORAGE_HASH_PASSWORD_OUTPUT_HERE|$HASH|" /tmp/secretful.yaml
+          ./target/release/file-storage --config /tmp/secretful.yaml &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/health && break || sleep 1; done
+          curl -sf http://127.0.0.1:8080/health > /dev/null
+      - run: ./scripts/dashboard_smoke.sh http://127.0.0.1:8080
+      - name: stop
+        if: always()
+        run: kill -9 %1 2>/dev/null || true
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: [clippy-test-linux]
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t file-storage:ci .
+      - name: C-01 gate — secretless boot must fail
+        run: |
+          set +e
+          docker run --rm file-storage:ci --config /run/secrets/file-storage.yaml
+          code=$?
+          set -e
+          test "$code" -ne 0 || { echo "C-01 VIOLATION: booted without secrets"; exit 1; }
+      - name: secretful boot + expect-fail smoke
+        run: |
+          cp secrets/file-storage.yaml.example secrets/file-storage.yaml
+          sed -i "s/PASTE_openssl_rand_hex_32_HERE/$(openssl rand -hex 32)/" secrets/file-storage.yaml
+          sed -i "s/PASTE_openssl_rand_hex_24_HERE/$(openssl rand -hex 24)/" secrets/file-storage.yaml
+          HASH=$(docker run --rm --entrypoint /usr/local/bin/file-storage file-storage:ci hash-password --password bootstrap-admin-pw-1)
+          sed -i "s|PASTE_FILE_STORAGE_HASH_PASSWORD_OUTPUT_HERE|$HASH|" secrets/file-storage.yaml
+          docker compose up -d --wait
+          bash poc_expect_fail.sh
+
+  nightly:
+    if: github.event_name == 'schedule'
+    runs-on: [self-hosted, release-box]
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo bench --bench throughput
+      - run: cargo test --release --test regression_hardening h01_upload_memory_bound -- --include-ignored

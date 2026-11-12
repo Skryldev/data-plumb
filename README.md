@@ -1,9 +1,9 @@
-# Data-Plumb
+# file-storage
 
 A production-grade **hybrid chunked content-addressed file storage microservice** in Rust.
 
 ```
-upload ──► validate ──► FastCDC chunk ──► BLAKE3 hash ──► zstd ──► AES-256-GCM (opt.)
+upload ──► validate (magic bytes, enforce|off) ──► FastCDC chunk ──► BLAKE3 hash ──► zstd ──► AES-256-GCM (opt.)
                                                                      │
         ┌────────────────────────────────────────────────────────────┘
         ▼
@@ -18,8 +18,9 @@ upload ──► validate ──► FastCDC chunk ──► BLAKE3 hash ──�
                 · L3 manifests (10k / 60 s)
 ```
 
+* **Content validation (H-03)** — the declared content-type is checked against sniffed magic bytes of the first chunk (`validation.mode: enforce` default; `off` is a loud operator opt-out). Downloads always carry `X-Content-Type-Options: nosniff`, active-content types are forced to `Content-Disposition: attachment`, and responses carry `Vary: Authorization`.
 * **Content addressing** — chunks are keyed by BLAKE3; identical content is stored once and reference-counted (dedup ≥2× on duplicate-heavy workloads, uniform content collapses to a single chunk).
-* **Crash safety** — blobs are fsynced *before* the atomic index transaction that references them; a crash can only leave a GC-able orphan, never a dangling ref. redb commits are `Durability::Immediate` (WAL + fsync).
+* **Crash safety** — blobs are fsynced *before* the verified index transaction that references them (C-03: registration re-checks blob presence inside the same transaction, and the uploader self-heals against racing GC/purge). A crash can leave a GC-able orphan or — in the transaction-sized register→manifest window — a refcount row reclaimed by the periodic reconcile pass (`retention.reconcile_interval_secs`, default hourly — M-01, now implemented). redb commits are `Durability::Immediate` (WAL + fsync).
 * **Soft delete + GC** — deletes are tombstones; a background collector purges after a grace period, drops zero-refcount blobs and sweeps orphans (refcount mode on primaries, reachability mode on replicas).
 * **Replication** — async WAL-style shipper (batch 64 ops / 5 s flush, exponential backoff 100 ms → 500 ms → 2 s) to a replica, or sync mode that blocks the upload until the batch is acknowledged. Replicas can pull missing blobs on demand from the upstream primary.
 * **Read path** — L1 → L2 → disk with BLAKE3 verification after every disk load, N+1..N+4 read-ahead prefetch, HTTP `Range` (206/416) and `ETag`/`If-None-Match` (304).
@@ -167,18 +168,18 @@ Generate a password hash: `file-storage hash-password --password '…'` (argon2i
 
 ## Design notes
 
-* **Encrypted dedup.** Random nonces make ciphertext-addressed dedup impossible, so with `encryption.enabled=true` the block-store key becomes `BLAKE3(tenant_id ‖ chunk_hash)` (`ChunkRef.plain_hash` still holds the plaintext hash for read-back verification). Dedup remains exact *within* a tenant and is disabled across tenants — information leakage is impossible by construction.
+* **Dedup scoping.** Random nonces make ciphertext-addressed dedup impossible, so with `encryption.enabled=true` the block-store key becomes `BLAKE3(tenant_id ‖ chunk_hash)` (`ChunkRef.plain_hash` still holds the plaintext hash for read-back verification). **Plaintext-mode caveat (audit M-16, open ticket):** with encryption off, keys are raw content hashes — dedup is currently global across tenants, which is a content-existence oracle; the remediation plan (M-16) switches the default to tenant-scoped keys behind `dedup.scope`. Until that lands, treat plaintext-mode dedup as an accepted, documented risk.
 * **Chunk boundaries are content-defined.** `fastcdc::v2020::AsyncStreamCDC` maintains its own rolling buffer; boundaries depend only on content, never on TCP packetisation (asserted by tests feeding the same bytes in different chunk sizes).
 * **Compression fallback.** Payloads below `compression.min_size` or that do not shrink are stored verbatim with `compressed=false` (explicit flag, not magic sniffing); decompression is bounded by the recorded `size_original` so corrupt input cannot allocate unboundedly.
 * **Same-name replacement** soft-deletes the previous manifest; its chunk refcounts keep the shared blobs alive until GC.
 * **Multi-range requests** are served as their first range (documented, RFC-7233-legal).
-* **Internal traffic is plain HTTP** inside the cluster (no TLS stack pulled in); terminate TLS at your ingress/load balancer for external traffic.
+* **Internal traffic is plain HTTP** inside the cluster (no TLS stack pulled in); terminate TLS at your ingress/load balancer for external traffic. This assumes a trusted VLAN or tunnel — the M-08 workstream adds per-peer keys + HMAC frame integrity and an optional TLS feature.
 * **Replication queue is in-memory** with bounded capacity (backpressure on send). A crash can lose un-flushed ops on the *primary*; sync mode closes that window at the cost of upload latency. The replica-side `?purge`/tombstone handling and pull-based repair (`upstream_url`) cover reconciliation.
 
 ## Development
 
 ```bash
-cargo test                 # 131 unit + 18 gRPC + 17 REST integration tests
+cargo test                 # 143 unit + 19 gRPC + 16 REST + 21 regression (race/purge/hardening/C-01 boot)
 cargo test --release       # same, optimized
 cargo clippy --all-targets # 0 warnings
 cargo fmt --check

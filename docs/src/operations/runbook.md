@@ -129,3 +129,46 @@ Keep a one-line incident log per scenario; the template matches the structure ab
 - [Replication Ops](./replication-ops.md) — resync and re-seed mechanics.
 - [GC Operations](./gc-operations.md) — grace-period and purge controls used in scenarios 1 and 5.
 - [Monitoring](./monitoring.md) — the alert rules referenced for prevention.
+
+### Scenario 6 — Drift reconciliation (M-01)
+
+**When:** after crash-loop incidents, `kill -9` during uploads, disk-full
+aborts, or as the scheduled hourly hygiene pass. The reconcile pass is the
+permanent guarantee behind the transaction-sized C-03 crash window: it
+finds state that should not exist and repairs it.
+
+**What it does** (rule 16 — `DryRun` never deletes):
+
+1. walks every manifest and collects the referenced chunk hashes;
+2. walks the blob directory, classifying each blob as referenced / orphan;
+3. counts phantom rows (index rows whose blob file is missing);
+4. `Repair` additionally tombstones chunk rows with `refcount > 0` but
+   zero manifest references — the decision is made inside ONE
+   `Durability::Immediate` transaction that re-walks every manifest, so a
+   manifest committed mid-pass keeps its chunks (C-03 race defense) — and
+   then lets the normal GC sweep reclaim the tombstoned blobs.
+
+**On demand** (audited, admin-only, both transports):
+
+```bash
+# report only — never deletes
+curl -s -X POST "localhost:8080/api/v1/admin/gc?reconcile=true&dry_run=true" \
+  -H "Authorization: Bearer $ADMIN" | jq
+
+# repair — tombstone + sweep
+curl -s -X POST "localhost:8080/api/v1/admin/gc?reconcile=true" \
+  -H "Authorization: Bearer $ADMIN" | jq
+```
+
+gRPC: `AdminService/TriggerGC` with `reconcile=true` (`dry_run=true` for
+the read-only report).
+
+**Schedule:** `retention.reconcile_interval_secs` (default 3600, `0`
+disables). Locking: concurrent GC passes and admin triggers queue behind
+the in-process lock; a second *process* sharing the data dir gets
+`503 Unavailable` from the `run/reconcile.lock` flock.
+
+**Alerting:** `file_storage_gc_reconcile_leaked_total` counts orphans a
+Repair pass observed. Expected ~0; steady growth means the crash window
+is being exercised (crash loops, `kill -9` mid-upload) or a peer shares
+the data dir unsafely.

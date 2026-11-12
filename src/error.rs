@@ -28,6 +28,10 @@ pub enum StorageError {
     #[error("range not satisfiable (size={0})")]
     RangeNotSatisfiable(u64),
 
+    /// H-03: declared content-type does not match the sniffed magic bytes.
+    #[error("unsupported media type: {0}")]
+    UnsupportedMediaType(String),
+
     #[error("hash mismatch: expected {expected}, got {actual}")]
     HashMismatch { expected: String, actual: String },
 
@@ -58,6 +62,11 @@ pub enum StorageError {
     #[error("service unavailable: {0}")]
     Unavailable(String),
 
+    /// M-05: login throttle engaged (or REST/gRPC rate limit). Maps to
+    /// 429 Too Many Requests / RESOURCE_EXHAUSTED.
+    #[error("rate limited: {0}")]
+    Throttled(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -73,6 +82,7 @@ impl StorageError {
             StorageError::Conflict(_) => StatusCode::CONFLICT,
             StorageError::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             StorageError::RangeNotSatisfiable(_) => StatusCode::RANGE_NOT_SATISFIABLE,
+            StorageError::UnsupportedMediaType(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             StorageError::HashMismatch { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             StorageError::Corruption(_) => StatusCode::INTERNAL_SERVER_ERROR,
             StorageError::Compression(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -83,6 +93,7 @@ impl StorageError {
             StorageError::Serialization(_) => StatusCode::INTERNAL_SERVER_ERROR,
             StorageError::Replication(_) => StatusCode::BAD_GATEWAY,
             StorageError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            StorageError::Throttled(_) => StatusCode::TOO_MANY_REQUESTS,
             StorageError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -97,6 +108,7 @@ impl StorageError {
             StorageError::Conflict(_) => "conflict",
             StorageError::TooLarge(_) => "payload_too_large",
             StorageError::RangeNotSatisfiable(_) => "range_not_satisfiable",
+            StorageError::UnsupportedMediaType(_) => "unsupported_media_type",
             StorageError::HashMismatch { .. } => "hash_mismatch",
             StorageError::Corruption(_) => "corruption",
             StorageError::Compression(_) => "compression_error",
@@ -107,6 +119,7 @@ impl StorageError {
             StorageError::Serialization(_) => "serialization_error",
             StorageError::Replication(_) => "replication_error",
             StorageError::Unavailable(_) => "service_unavailable",
+            StorageError::Throttled(_) => "rate_limited",
             StorageError::Internal(_) => "internal_error",
         }
     }

@@ -7,26 +7,87 @@ use axum::Extension;
 use axum::Json;
 use uuid::Uuid;
 
-use crate::api::dto::{AuditEntryDto, GcReportDto, ResyncDto};
+use crate::api::dto::{AuditEntryDto, ResyncDto};
 use crate::api::middleware::auth::require_admin;
 use crate::error::StorageError;
+use crate::gc::ReconcileMode;
 use crate::replication::client::{ChunkPayload, ReplicationClient};
+use crate::security::audit::{Actor, AuditAction};
 use crate::security::auth::AuthContext;
 use crate::security::tenant::check_access;
 use crate::state::AppState;
 
+/// M-01: `POST /admin/gc?reconcile=true&dry_run=true`.
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct GcQuery {
+    pub reconcile: Option<bool>,
+    pub dry_run: Option<bool>,
+}
+
 pub async fn trigger_gc(
     State(state): State<AppState>,
     Extension(ctx): Extension<AuthContext>,
+    Query(q): Query<GcQuery>,
 ) -> Result<impl IntoResponse, StorageError> {
+    // M-04a parity: admin-only, enforced by require_admin + the router.
     require_admin(&ctx)?;
+    if q.reconcile.unwrap_or(false) {
+        let mode = if q.dry_run.unwrap_or(false) {
+            ReconcileMode::DryRun
+        } else {
+            ReconcileMode::Repair
+        };
+        let report = state.0.gc.reconcile(mode).await?;
+        // M-01: every admin reconcile trigger is audited with actor + mode
+        // + outcome counts.
+        state
+            .0
+            .audit
+            .record(
+                AuditAction::GcRun,
+                Actor::User(ctx.username.clone()),
+                None,
+                "admin/gc",
+                "",
+                "ok",
+                &format!(
+                    "reconcile mode={mode:?} orphans={} tombstoned={} reclaimed={}",
+                    report.orphan_chunks, report.tombstoned, report.reclaimed
+                ),
+            )
+            .await;
+        return Ok(Json(serde_json::json!({
+            "mode": mode,
+            "scanned_blobs": report.scanned_blobs,
+            "scanned_index_entries": report.scanned_index_entries,
+            "referenced_chunks": report.referenced_chunks,
+            "orphan_chunks": report.orphan_chunks,
+            "phantom_manifests": report.phantom_manifests,
+            "tombstoned": report.tombstoned,
+            "reclaimed": report.reclaimed,
+            "duration_ms": report.duration.as_millis() as u64,
+        })));
+    }
     let report = state.0.gc.run_once().await?;
-    Ok(Json(GcReportDto {
-        manifests_purged: report.manifests_purged,
-        chunks_removed: report.chunks_removed,
-        orphans_removed: report.orphans_removed,
-        bytes_reclaimed: report.bytes_reclaimed,
-    }))
+    state
+        .0
+        .audit
+        .record(
+            AuditAction::GcRun,
+            Actor::User(ctx.username.clone()),
+            None,
+            "admin/gc",
+            "",
+            "ok",
+            "plain sweep",
+        )
+        .await;
+    Ok(Json(serde_json::json!({
+        "manifests_purged": report.manifests_purged,
+        "chunks_removed": report.chunks_removed,
+        "orphans_removed": report.orphans_removed,
+        "bytes_reclaimed": report.bytes_reclaimed,
+    })))
 }
 
 #[derive(Debug, serde::Deserialize, Default)]

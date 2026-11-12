@@ -38,10 +38,24 @@ fn code_name(code: i32) -> &'static str {
     }
 }
 
-/// Extracts the RPC method path (`/pkg.Service/Method`) from the URI.
+/// Extracts the RPC method path from the URI.
+///
+/// H-05: only a well-formed `/package.Service/Method` path is recorded
+/// verbatim; ANY other value (attacker-controlled HTTP/2 `:path` on the
+/// gRPC port) collapses into the single `:unparsed` bucket, so the `rpc`
+/// label cardinality is bounded by the service surface, not by input.
 fn rpc_of(path: &str) -> String {
-    // Splitting keeps the cardinality bounded: one label per RPC.
-    path.to_string()
+    let p = path;
+    if p.starts_with('/')
+        && p.matches('/').count() == 2
+        && p.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '/' || c == '_')
+        && !p.contains("..")
+    {
+        p.to_string()
+    } else {
+        ":unparsed".to_string()
+    }
 }
 
 /// Layer constructor; applied via `Server::builder().layer(...)`.

@@ -13,6 +13,10 @@ pub const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 #[derive(Clone)]
 pub struct Compressor {
+    /// H-04: maximum legitimate plaintext size for one chunk. Decompression
+    /// is clamped to this server-side bound — `size_original` from the index
+    /// or a replication peer is UNTRUSTED.
+    max_chunk_plain: u64,
     pub level: i32,
     pub min_size: usize,
 }
@@ -28,7 +32,17 @@ pub struct CompressOutcome {
 
 impl Compressor {
     pub fn new(level: i32, min_size: usize) -> Self {
-        Self { level, min_size }
+        Self::with_max_plain(level, min_size, 16 * 1024 * 1024)
+    }
+
+    /// Builds a compressor with the server-side decompression ceiling wired
+    /// from `chunking.max` (H-04).
+    pub fn with_max_plain(level: i32, min_size: usize, max_chunk_plain: u64) -> Self {
+        Self {
+            max_chunk_plain,
+            level,
+            min_size,
+        }
     }
 
     pub fn compress(&self, data: &[u8]) -> CompressOutcome {
@@ -60,31 +74,39 @@ impl Compressor {
         }
     }
 
-    /// Inverse of [`Compressor::compress`]. The output size bound comes from
-    /// chunk metadata, so corrupt input can never allocate unboundedly.
+    /// Inverse of [`Compressor::compress`].
+    ///
+    /// H-04: `size_hint` is UNTRUSTED (redb row, replication peer, or future
+    /// tooling). The allocation is clamped to `max_chunk_plain` — a chunk
+    /// can never legitimately exceed `chunking.max` plaintext bytes — so a
+    /// hostile `size_original` can neither panic (`u64::MAX` previously hit
+    /// `Vec::with_capacity` "capacity overflow") nor attempt multi-GiB
+    /// allocations. Any mismatch between the honest size and the hint is a
+    /// Corruption error, never an allocation size.
     pub fn decompress(
         &self,
         data: &[u8],
         compressed: bool,
-        size_original: usize,
+        size_hint: u64,
     ) -> Result<Bytes, StorageError> {
         if !compressed {
-            if data.len() != size_original {
+            if data.len() as u64 != size_hint {
                 return Err(StorageError::Corruption(format!(
-                    "raw chunk size {} != expected {}",
-                    data.len(),
-                    size_original
+                    "raw chunk size {} != expected {size_hint}",
+                    data.len()
                 )));
             }
             return Ok(Bytes::copy_from_slice(data));
         }
-        let out = zstd::bulk::decompress(data, size_original)
+        let cap = usize::try_from(size_hint.min(self.max_chunk_plain)).map_err(|_| {
+            StorageError::Corruption("size_original out of range for this platform".to_string())
+        })?;
+        let out = zstd::bulk::decompress(data, cap)
             .map_err(|e| StorageError::Compression(format!("zstd decompress: {e}")))?;
-        if out.len() != size_original {
+        if out.len() as u64 != size_hint {
             return Err(StorageError::Corruption(format!(
-                "decompressed {} bytes, expected {}",
-                out.len(),
-                size_original
+                "decompressed {} bytes, expected {size_hint}",
+                out.len()
             )));
         }
         Ok(Bytes::from(out))
@@ -112,7 +134,7 @@ mod tests {
         assert!(out.compressed);
         assert!(out.size_stored < 1_000);
         let back = c
-            .decompress(&out.data, out.compressed, out.size_original as usize)
+            .decompress(&out.data, out.compressed, out.size_original)
             .unwrap();
         assert_eq!(back.as_ref(), data);
     }
@@ -123,7 +145,7 @@ mod tests {
         let data: Vec<u8> = (0..4096u32).map(|i| ((i * 7919) % 256) as u8).collect();
         let out = c.compress(&data);
         if out.compressed {
-            let back = c.decompress(&out.data, true, data.len()).unwrap();
+            let back = c.decompress(&out.data, true, data.len() as u64).unwrap();
             assert_eq!(back.as_ref(), data);
         } else {
             assert_eq!(out.size_stored, data.len() as u64);
@@ -143,8 +165,12 @@ mod tests {
         let c = compressor();
         let data = vec![b'x'; 10_000];
         let out = c.compress(&data);
-        assert!(c.decompress(&out.data, true, data.len() + 1).is_err());
-        assert!(c.decompress(&out.data, true, data.len() - 1).is_err());
+        assert!(c
+            .decompress(&out.data, true, (data.len() + 1) as u64)
+            .is_err());
+        assert!(c
+            .decompress(&out.data, true, (data.len() - 1) as u64)
+            .is_err());
     }
 
     #[test]
@@ -156,7 +182,7 @@ mod tests {
         // the BLAKE3 verification on the retrieval path, because zstd frames
         // do not carry a checksum at this level.)
         let truncated = &out.data[..out.data.len() - 3];
-        let r = c.decompress(truncated, true, data.len());
+        let r = c.decompress(truncated, true, data.len() as u64);
         assert!(r.is_err());
     }
 

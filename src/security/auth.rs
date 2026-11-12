@@ -7,6 +7,7 @@ use dashmap::DashMap;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -74,6 +75,9 @@ pub struct AuthService {
     access_ttl: Duration,
     refresh_ttl: Duration,
     refreshes: DashMap<String, RefreshEntry>,
+    /// M-05: per-username exponential login lockout (checked before the
+    /// argon2 verify; see security::throttle for the fail-open contract).
+    throttle: Arc<crate::security::throttle::LoginThrottle>,
     /// Constant-cost dummy hash so unknown users burn the same argon2 time
     /// as wrong passwords (mitigates username enumeration by timing).
     dummy_hash: String,
@@ -100,8 +104,15 @@ impl AuthService {
             access_ttl: Duration::from_secs(cfg.access_ttl_secs),
             refresh_ttl: Duration::from_secs(cfg.refresh_ttl_secs),
             refreshes: DashMap::new(),
+            throttle: crate::security::throttle::LoginThrottle::from_cfg(&cfg.login_throttle),
             dummy_hash: dummy,
         }
+    }
+
+    /// M-05: read-only view of the throttle (used by gate tests and the
+    /// audit wiring; never bypasses it).
+    pub fn login_throttle(&self) -> &crate::security::throttle::LoginThrottle {
+        &self.throttle
     }
 
     fn verify_password(&self, user: &UserConfig, password: &str) -> Result<bool, StorageError> {
@@ -119,24 +130,40 @@ impl AuthService {
     }
 
     /// Validates credentials and returns a fresh token pair.
+    ///
+    /// M-05 order of operations (rule 17):
+    /// 1. throttle check BEFORE argon2 (cheap-fail protects the 64 MiB
+    ///    verify budget);
+    /// 2. verify — fail-CLOSED: a verifier/backend error propagates and is
+    ///    NOT recorded as a throttle failure (a flaky password store must
+    ///    not lock out its user);
+    /// 3. `InvalidCredentials` records a throttle failure;
+    /// 4. success resets the backoff.
     pub fn login(&self, username: &str, password: &str) -> Result<TokenPair, StorageError> {
+        self.throttle.check(username)?;
         let user = self.users.iter().find(|u| u.username == username);
-        let ok = match user {
-            Some(u) => self.verify_password(u, password)?,
+        let verify = match user {
+            Some(u) => self.verify_password(u, password),
             None => {
                 // burn comparable time for unknown users
-                let _ = PasswordHash::new(&self.dummy_hash).ok().and_then(|h| {
+                let burned = PasswordHash::new(&self.dummy_hash).ok().and_then(|h| {
                     Argon2::default()
                         .verify_password(password.as_bytes(), &h)
                         .ok()
                 });
-                false
+                let _ = burned;
+                Ok(false)
             }
         };
+        // Verifier errors (corrupted/invalid stored hash) are fail-closed:
+        // they NEVER authenticate and NEVER count toward the lockout.
+        let ok = verify?;
         if !ok {
+            self.throttle.record_failure(username);
             return Err(StorageError::Unauthorized("invalid credentials".into()));
         }
         let user = user.expect("checked above");
+        self.throttle.record_success(username);
         Ok(self.issue_pair(&user.username, user.tenant_id, user.role))
     }
 
@@ -267,6 +294,7 @@ mod tests {
             jwt_secret: "test-secret-0123456789abcdef".into(),
             access_ttl_secs: 60,
             refresh_ttl_secs: 600,
+            login_throttle: crate::config::ThrottleConfig::default(),
             users: vec![
                 UserConfig {
                     username: "alice".into(),

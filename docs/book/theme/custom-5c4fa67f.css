@@ -1,0 +1,82 @@
+/* file-storage documentation theme: orange accent (#F97316), dark code blocks. */
+
+:root {
+    --accent: #f97316;
+    --accent-strong: #ea580c;
+}
+
+/* Light themes */
+.light .content main a,
+.rust .content main a {
+    color: var(--accent-strong);
+}
+
+/* Dark themes (ayu default) */
+.ayu .content main a,
+.navy .content main a,
+.coal .content main a {
+    color: var(--accent);
+}
+
+/* Headings get a subtle accent underline */
+.content main h1 {
+    border-bottom: 2px solid var(--accent);
+    padding-bottom: 0.25rem;
+}
+
+/* Dark code blocks everywhere, matching terminal aesthetics */
+.content code,
+.content pre {
+    border-radius: 6px;
+}
+
+.ayu .content code,
+.navy .content code,
+.coal .content code {
+    background: #1e2430;
+}
+
+.ayu .content pre,
+.navy .content pre,
+.coal .content pre {
+    background: #12161f;
+    border: 1px solid #2b3345;
+}
+
+/* Tables: compact, bordered */
+.content table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1rem 0;
+}
+
+.content table th,
+.content table td {
+    border: 1px solid rgba(128, 128, 128, 0.35);
+    padding: 6px 10px;
+    text-align: left;
+}
+
+.content table th {
+    background: rgba(249, 115, 22, 0.12);
+}
+
+/* Blockquotes: accent bar */
+.content blockquote {
+    border-left: 3px solid var(--accent);
+    padding-left: 0.8rem;
+}
+
+/* Mermaid figures: centered */
+figure {
+    margin: 1.5rem auto;
+    text-align: center;
+}
+
+figcaption,
+em.caption {
+    font-size: 0.9em;
+    opacity: 0.8;
+    display: block;
+    margin-top: 0.4rem;
+}

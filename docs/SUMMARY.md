@@ -54,6 +54,7 @@
 - [Hardening Checklist](./src/security/hardening.md)
 
 # Operations
+- [Bootstrap & Secrets](./src/operations/bootstrap.md)
 - [Monitoring](./src/operations/monitoring.md)
 - [Backup & Restore](./src/operations/backup-restore.md)
 - [GC Operations](./src/operations/gc-operations.md)

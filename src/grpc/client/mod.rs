@@ -361,12 +361,33 @@ impl FileStorageClient {
         self.retry.run(op).await
     }
 
+    /// Admin: trigger the M-01 drift-reconciliation pass (dry_run = report
+    /// only, rule 16).
+    pub async fn trigger_reconcile(&self, dry_run: bool) -> Result<pb::GcResult, Status> {
+        let op = || async {
+            self.admin
+                .clone()
+                .trigger_gc(self.authed(pb::TriggerGcRequest {
+                    mode: 0,
+                    dry_run,
+                    reconcile: true,
+                }))
+                .await
+                .map(|r| r.into_inner())
+        };
+        self.retry.run(op).await
+    }
+
     /// Admin: trigger one GC pass.
     pub async fn trigger_gc(&self, mode: i32, dry_run: bool) -> Result<pb::GcResult, Status> {
         let op = || async {
             self.admin
                 .clone()
-                .trigger_gc(self.authed(pb::TriggerGcRequest { mode, dry_run }))
+                .trigger_gc(self.authed(pb::TriggerGcRequest {
+                    mode,
+                    dry_run,
+                    reconcile: false,
+                }))
                 .await
                 .map(|r| r.into_inner())
         };

@@ -83,6 +83,11 @@ pub fn base_config(tag: &str) -> (AppConfig, tempfile::TempDir) {
     let tenant_c: Uuid = "01930000-0000-7000-8000-000000000003".parse().unwrap();
     let mut cfg = AppConfig::for_tests();
     cfg = cfg.with_data_root(dir.path());
+    // M-05: the shared harness performs deliberate failed logins (authz
+    // scenarios); the per-username lockout would cross-contaminate tests
+    // on one server. The throttle gates (tests/regression/m05_throttle.rs)
+    // enable it explicitly on their own servers.
+    cfg.auth.login_throttle.enabled = false;
     cfg.auth.users = vec![
         UserConfig {
             username: "admin".into(),

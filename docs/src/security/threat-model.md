@@ -58,6 +58,7 @@ file-storage stores customer content, so the model treats data confidentiality a
 | Credential brute force | argon2id hashing (configurable via `password_hash`), rate limiting on both transports, login failures audited | `src/security/auth.rs`, `src/api/middleware/rate_limit.rs` |
 | Cross-tenant data access | Every handler calls tenant access checks; admins alone may cross tenants; name/tag indexes are tenant-prefixed | `src/security/tenant.rs`, `src/api/middleware/tenant.rs` |
 | Key file theft | Key files created `0600` at first use; runtime image is distroless/nonroot | `src/security/encryption.rs`, `Dockerfile` |
+| Compromised primary serves poisoned chunk bytes (replica repair) | **M-07 verify-then-persist**: pulled bytes are decrypted + decompressed and BLAKE3-verified against the chunk reference's `plain_hash` BEFORE anything is persisted. Mismatches go to `quarantine/` (size-bounded, boot-swept), the L2 entry is invalidated, `file_storage_repair_hash_mismatch_total{source="repair"}` ticks, and the caller gets `Corruption`. Nothing lands in the CAS or cache unverified | `src/storage/retrieval.rs::repair_chunk`, `src/storage/quarantine.rs` |
 | Forged replication operations | Shared `api_key` required (`x-api-key` metadata / `X-Api-Key` header), constant-time comparison, mTLS peer certificates | `src/grpc/interceptors/api_key.rs`, `src/api/middleware/auth.rs` |
 | Filenames/metadata exposure on stolen disks | **Residual risk by design**: manifests, names and tags live unencrypted in redb. Mitigate with disk/host-level encryption | `src/storage/index_db.rs` |
 | Panic-based crashes | Panic recovery on both stacks converts panics to error responses | `src/grpc/interceptors/recovery.rs`, `src/api/router.rs` |
@@ -83,10 +84,11 @@ curl -s localhost:8080/api/v1/files -H "Authorization: Bearer $BOB" | jq .total 
 
 ### Residual risks (documented honestly)
 
+- **Ciphertext-only replicas skip repair verification**: a replica WITHOUT the tenant key (`encryption.enabled=false`) cannot decrypt what it pulls, so it cannot verify before persisting. Those repairs keep the legacy persist-then-serve order with a loud `warn!` per event and the `file_storage_repair_ciphertext_only_total` metric — run the documented compose mode (tenants replicated WITH their keys) to get full M-07 protection. Unverifiable ≠ hostile: these bytes are NOT quarantined, they are classified as untrusted-until-read-verified.
 - Refresh tokens are held in an **in-memory store**: a restart invalidates all sessions (a crude but effective logout-all), and un-flushed sessions are lost.
 - The audit log is not cryptographically chained; tamper evidence requires external shipping/backup.
 - Quota accounting is informational only (`file_count`, `bytes_used`) — there is no enforcement.
-- Streaming gRPC RPCs are not rate limited (documented limitation of the token bucket, which guards unary calls).
+- The login lockout map and RPC-governor map are bounded at 10 000 entries with oldest-first eviction; a sustained flood of >10 000 distinct usernames/tenants churns entries (bounded memory, no unbounded growth).
 
 ## See also
 

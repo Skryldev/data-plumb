@@ -40,6 +40,24 @@ pub async fn login(
                 .await;
             Ok((StatusCode::OK, Json(to_dto(pair))))
         }
+        Err(e @ StorageError::Throttled(_)) => {
+            // M-05: the lockout event is its own audit action (distinct
+            // from a plain credential failure) with the retry window.
+            state
+                .0
+                .audit
+                .record(
+                    AuditAction::LoginThrottled,
+                    Actor::User(req.username.clone()),
+                    None,
+                    &req.username,
+                    "",
+                    "throttled",
+                    &e.to_string(),
+                )
+                .await;
+            Err(e)
+        }
         Err(e) => {
             state
                 .0
