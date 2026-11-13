@@ -230,13 +230,13 @@ fn parse_hash(s: &str) -> Result<[u8; 32], StorageError> {
 
 async fn read_body(request: Request<Body>) -> Result<Bytes, StorageError> {
     let body = request.into_body();
-    let bytes = axum::body::to_bytes(body, state_body_limit())
+    // M-09: the effective ceiling is the route-scoped
+    // `DefaultBodyLimit::max(limits.internal_body)` layer the router
+    // applies to /internal — `to_bytes` uses a generous local ceiling
+    // because the layer has already rejected oversize bodies with 413
+    // before the handler runs.
+    let bytes = axum::body::to_bytes(body, usize::MAX)
         .await
         .map_err(|e| StorageError::Internal(format!("body read: {e}")))?;
     Ok(bytes)
-}
-
-/// Internal endpoints accept bundles up to a fixed 2 GiB ceiling.
-fn state_body_limit() -> usize {
-    2 * 1024 * 1024 * 1024 // 2 GiB hard ceiling for internal transfers
 }

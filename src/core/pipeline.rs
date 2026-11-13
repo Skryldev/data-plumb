@@ -57,6 +57,7 @@ struct StoredChunk {
     dedup_hit: bool,
 }
 
+#[derive(Clone)]
 pub struct UploadPipeline {
     index: Arc<IndexDb>,
     blocks: Arc<BlockStore>,
@@ -147,6 +148,9 @@ impl UploadPipeline {
         let mime_for_check = Arc::new(mime.to_string());
         let index = self.index.clone();
         let replicator = self.replicator.clone();
+        // V6-07: the fused per-chunk stage re-asserts the blob after the
+        // registration txn via the pipeline handle below.
+        let pipeline_self = Arc::new(self.clone());
         let processed = chunked.map(move |res| {
             let compressor = self.compressor.clone();
             let blocks = self.blocks.clone();
@@ -158,6 +162,7 @@ impl UploadPipeline {
             let mime_for_check = mime_for_check.clone();
             let index = index.clone();
             let replicator = replicator.clone();
+            let pipeline_self = pipeline_self.clone();
             let compressor = compressor.clone();
             let encryptor = encryptor.clone();
             let blocks = blocks.clone();
@@ -183,7 +188,14 @@ impl UploadPipeline {
                     storage_hash,
                 };
                 store_chunk(
-                    raw, compressor, encryptor, blocks, index, replicator, tenant,
+                    raw,
+                    compressor,
+                    encryptor,
+                    blocks,
+                    index,
+                    replicator,
+                    tenant,
+                    pipeline_self,
                 )
                 .await
             }
@@ -298,6 +310,47 @@ impl UploadPipeline {
     }
 }
 
+impl UploadPipeline {
+    /// V6-07: post-registration blob re-assert — the last defense of the
+    /// C-03 protocol. Window: the registration transaction committed
+    /// (row refcount >= 1) and a racing GC/purge that snapshot-read the
+    /// index BEFORE the commit then claimed + deleted the blob (its
+    /// resurrection re-check could not see the uncommitted row). The row
+    /// is now live and the blob gone — a dangling manifest waiting to
+    /// happen. This re-assert checks the canonical path and, when the
+    /// racing delete won, rewrites the bytes (CAS: identical content) so
+    /// the committed row always has its blob.
+    ///
+    /// Cheap on the happy path (one `path_exists` stat per chunk); the
+    /// rewrite fires only when the race was actually lost (metric:
+    /// `file_storage_chunk_register_race_total`).
+    pub async fn verify_blob_after_register(
+        &self,
+        hash: &[u8; 32],
+        blob: &[u8],
+    ) -> Result<(), StorageError> {
+        let path = self.blocks.relative_path(hash);
+        if self.blocks.path_exists(&path) {
+            return Ok(());
+        }
+        // The race was lost between the registration txn and now.
+        metrics::record_register_race(1);
+        tracing::warn!(
+            hash = %hex::encode(hash),
+            "V6-07: blob vanished after verified registration (racing GC/purge); rewriting"
+        );
+        self.blocks.write(hash, blob).await?;
+        // Confirm the rewrite landed; a second failure is a real fs error.
+        if !self.blocks.path_exists(&path) {
+            return Err(StorageError::Conflict(format!(
+                "chunk blob lost after registration and rewrite failed for {}",
+                hex::encode(hash)
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Compress → encrypt → atomic blob write for one chunk.
 /// H-01 fused per-chunk stage: compress → encrypt → write blob →
 /// verified registration (C-03 self-heal, up to 3 attempts) → replication
@@ -311,6 +364,7 @@ async fn store_chunk(
     index: Arc<IndexDb>,
     replicator: Arc<Replicator>,
     tenant: Uuid,
+    pipeline_self: Arc<UploadPipeline>,
 ) -> Result<StoredChunk, StorageError> {
     let CompressOutcome {
         data: comp_data,
@@ -371,6 +425,12 @@ async fn store_chunk(
                 .to_string(),
         ));
     }
+
+    // V6-07: the registration committed — re-assert the blob (closes the
+    // claim+delete-after-commit window; see verify_blob_after_register).
+    pipeline_self
+        .verify_blob_after_register(&raw.storage_hash, &blob)
+        .await?;
 
     // H-01: replication op ships while the chunk's bytes are still local —
     // nothing is deferred to stream end.

@@ -324,6 +324,13 @@ pub struct LimitsConfig {
     /// H-01: global cap on concurrent upload pipeline tasks.
     #[serde(default = "default_max_concurrent_uploads")]
     pub max_concurrent_uploads: usize,
+    /// M-09: body ceiling for the `/internal` replication endpoints
+    /// (file bundles carry the FULL manifest + chunk set, which can exceed
+    /// the public upload body cap). Defaults to max_file_size + 64 MiB of
+    /// framing headroom; independent of `max_body` so a 1 GiB public cap
+    /// never silently clips replication bundles.
+    #[serde(default = "default_internal_body")]
+    pub internal_body: usize,
 }
 
 fn default_in_flight_bytes() -> u64 {
@@ -332,6 +339,13 @@ fn default_in_flight_bytes() -> u64 {
 
 fn default_max_concurrent_uploads() -> usize {
     64
+}
+
+fn default_internal_body() -> usize {
+    // max_file_size default (10 GiB) + 64 MiB framing headroom — but
+    // usize on 32-bit targets would overflow; clamp sanely.
+    let bytes = 10 * 1024 * 1024 * 1024u64 + 64 * 1024 * 1024;
+    usize::try_from(bytes).unwrap_or(usize::MAX / 2)
 }
 
 /// H-05/M-17: how `/metrics` (and other ops endpoints) may be reached.
@@ -518,6 +532,7 @@ impl AppConfig {
                 max_body: 1024 * 1024 * 1024,
                 max_in_flight_bytes: 512 * 1024 * 1024,
                 max_concurrent_uploads: 32,
+                internal_body: 2 * 1024 * 1024 * 1024,
             },
             metrics: MetricsConfig::default(),
             validation: ValidationConfig::default(),

@@ -430,3 +430,67 @@ async fn boot_sweep_quarantine() {
         "startup_quarantine_swept metric must tick, render:\n{render}"
     );
 }
+
+// -- V6-09: missing tenant key is a misconfiguration, NOT hostile bytes -----
+
+/// With encryption ON but the tenant key file wiped, a repair must NOT
+/// quarantine the (valid) ciphertext: no quarantine file, no CAS write,
+/// `repair_key_missing_total` ticked, and the error is the distinct
+/// Encryption variant — retryable once the key is restored.
+#[tokio::test]
+async fn repair_key_missing_skips_quarantine() {
+    file_storage::metrics::init_recorder();
+    let mock = spawn_mock_upstream().await;
+    let dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+    let cfg = replica_config(&mock.addr, dir.path(), true); // encryption ON
+    let state = file_storage::state::build_state(Arc::new(cfg.clone()))
+        .await
+        .unwrap();
+
+    // 1. Upload honest content through the REAL pipeline (encrypted).
+    let data = pseudo_random(64_000, 11);
+    let manifest = upload(&state, data, "secret.bin").await;
+    let cr = manifest.chunks[0].clone();
+    assert!(cr.encrypted, "fixture requires encryption on");
+    let honest_blob = std::fs::read(blob_path(&state, &cr.hash)).unwrap();
+
+    // 2. Misconfiguration: destroy the local blob AND wipe the keys dir.
+    std::fs::remove_file(blob_path(&state, &cr.hash)).unwrap();
+    let keys_dir = dir.path().join("keys");
+    for e in std::fs::read_dir(&keys_dir).unwrap().flatten() {
+        std::fs::remove_file(e.path()).unwrap();
+    }
+
+    // 3. The upstream serves the HONEST ciphertext (proves the failure is
+    //    the missing key, not the peer).
+    mock.served
+        .write()
+        .await
+        .insert(hex::encode(cr.hash), honest_blob);
+
+    // 4. Repair attempt: distinct Encryption error, nothing quarantined,
+    //    nothing persisted.
+    let result = state.0.retrieval.load_plain(&manifest.tenant_id, &cr).await;
+    let err = result.expect_err("repair must fail without the tenant key");
+    assert!(
+        matches!(err, file_storage::error::StorageError::Encryption(_)),
+        "distinct Encryption error (local misconfiguration), got: {err}"
+    );
+    let qpath = cfg
+        .storage
+        .quarantine_dir()
+        .join(format!("{}.bin", hex::encode(cr.hash)));
+    assert!(
+        !qpath.exists(),
+        "valid ciphertext must NOT be quarantined when the key is merely missing (V6-09)"
+    );
+    assert!(
+        !state.0.blocks.exists(&cr.hash).await.unwrap(),
+        "unverifiable bytes must not land in the CAS on the key-missing path"
+    );
+    let render = file_storage::metrics::render();
+    assert!(
+        render.contains("file_storage_repair_key_missing_total"),
+        "repair_key_missing metric must tick (V6-09)"
+    );
+}

@@ -226,6 +226,7 @@ mod tests {
             max_body: 1024 * 1024,
             max_in_flight_bytes: 1024 * 1024,
             max_concurrent_uploads: 4,
+            internal_body: 1024 * 1024 * 8,
         }
     }
 

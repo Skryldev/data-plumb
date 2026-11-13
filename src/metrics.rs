@@ -60,6 +60,7 @@ pub const M_REPL_DROPPED: &str = "file_storage_replication_dropped_ops_total";
 pub const M_BOOT_TMP_SWEPT: &str = "file_storage_startup_tmp_swept_total";
 pub const M_REPAIR_MISMATCH: &str = "file_storage_repair_hash_mismatch_total";
 pub const M_REPAIR_CIPHERTEXT: &str = "file_storage_repair_ciphertext_only_total";
+pub const M_REPAIR_KEY_MISSING: &str = "file_storage_repair_key_missing_total";
 pub const M_BOOT_QUARANTINE_SWEPT: &str = "file_storage_startup_quarantine_swept";
 pub const M_GC_RECONCILE_LEAKED: &str = "file_storage_gc_reconcile_leaked_total";
 
@@ -163,6 +164,13 @@ pub fn record_repair_hash_mismatch() {
 /// replica posture — documented degraded mode, warn-logged per event).
 pub fn record_repair_ciphertext_only() {
     metrics::counter!(M_REPAIR_CIPHERTEXT, "source" => "repair_ciphertext_only").increment(1);
+}
+
+/// V6-09: repairs REFUSED because the tenant key file is missing — a local
+/// misconfiguration, distinct from hostile upstream bytes (nothing is
+/// quarantined) and from the opted-in ciphertext-only posture.
+pub fn record_repair_key_missing() {
+    metrics::counter!(M_REPAIR_KEY_MISSING, "source" => "repair_key_missing").increment(1);
 }
 
 pub fn record_startup_quarantine_swept(n: u64) {

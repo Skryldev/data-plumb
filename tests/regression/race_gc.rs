@@ -365,3 +365,95 @@ fn conflict_maps_to_409_and_grpc_code() {
     let status = e.to_grpc_status();
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
 }
+
+// -- V6-07: post-registration blob re-assert closes the last window ---------
+
+/// The µs-scale window `race_gc_upload_x100` cannot reliably hit, forced:
+/// the registration transaction commits (row refcount=1), then a GC whose
+/// index snapshot PRE-DATED the commit claims + deletes the blob (its
+/// resurrection re-check cannot see the uncommitted row). Without the
+/// pipeline's post-registration re-assert the row is live with no blob —
+/// a dangling manifest. With it, the bytes (still in scope in
+/// store_chunk) are rewritten and the manifest reads back.
+#[tokio::test]
+async fn v6_07_reassert_restores_blob_after_racing_gc_delete() {
+    let rig = rig(0);
+    let data = vec![7u8; 512];
+    let hash = file_storage::core::hasher::hash_bytes(&data);
+    let path = rig.blocks.relative_path(&hash);
+
+    // store_chunk step 1-2: blob written, verified registration committed.
+    rig.blocks.write(&hash, &data).await.unwrap();
+    let out = rig
+        .index
+        .register_chunk_verified(
+            file_storage::storage::index_db::ChunkRegistration {
+                hash,
+                size_stored: data.len() as u64,
+                on_disk_path: path.clone(),
+            },
+            {
+                let b = rig.blocks.clone();
+                move |p: &str| b.path_exists(p)
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out, file_storage::storage::index_db::RegisterOne::Fresh);
+
+    // The racing GC: its snapshot pre-dated the commit, so its re-check
+    // sees nothing, and its claim + delete is FINAL by the time the
+    // upload's txn committed.
+    let claimed = rig.blocks.claim_for_gc(&hash).await.unwrap();
+    assert!(claimed);
+    let referenced = rig.index.chunk_is_referenced(&hash).await.unwrap();
+    // NOTE: the row IS committed by now (refcount=1) — a live GC's
+    // re-check WOULD see it and restore. The forced scenario is the GC
+    // whose re-check ran pre-commit; we skip its restore to replay the
+    // exact interleaving.
+    let _ = referenced;
+    rig.blocks.delete_claimed(&hash).await.unwrap();
+    assert!(!rig.blocks.exists(&hash).await.unwrap(), "GC won the race");
+
+    // The row is live, the blob gone: exactly the V6-07 state.
+    assert!(rig.index.get_chunk_meta(&hash).await.unwrap().is_some());
+
+    // The pipeline's post-registration re-assert (store_chunk calls this
+    // with the bytes still in scope) rewrites and closes the window.
+    let (index, blocks) = (rig.index.clone(), rig.blocks.clone());
+    let pipeline = file_storage::core::pipeline::UploadPipeline::new(
+        index,
+        blocks,
+        std::sync::Arc::new(file_storage::core::compressor::Compressor::new(3, 64)),
+        None,
+        {
+            let cfg = file_storage::config::ReplicationConfig::default();
+            file_storage::replication::replicator::Replicator::start(&cfg, rig.index.clone())
+                .unwrap()
+        },
+        std::sync::Arc::new(file_storage::security::audit::AuditLog::new(
+            rig.index.clone(),
+        )),
+        std::sync::Arc::new(file_storage::core::validator::FileValidator::new(
+            1024 * 1024,
+        )),
+        &{
+            let mut cfg = file_storage::config::AppConfig::for_tests();
+            cfg = cfg.with_data_root(tempfile::tempdir_in(std::env::temp_dir()).unwrap().path());
+            cfg
+        },
+    );
+    pipeline
+        .verify_blob_after_register(&hash, &data)
+        .await
+        .unwrap();
+
+    // The committed registration now has its blob: the manifest that
+    // references this hash reads back (no dangling).
+    let blob = rig.blocks.read(&hash).await.unwrap();
+    assert_eq!(
+        blob.as_ref(),
+        data.as_slice(),
+        "dangling read closed by the re-assert"
+    );
+}
