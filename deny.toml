@@ -5,6 +5,11 @@
 [advisories]
 version = 2
 yanked = "warn"
+# V6-OPS-02: unmaintained advisories carry reviewed rationale in
+# .cargo/audit.toml (cargo-audit's discovery path) and are re-evaluated
+# quarterly. cargo-deny shares the RustSec DB, so the same two IDs are
+# exempted here (see that file for the full rationale prose).
+ignore = ["RUSTSEC-2025-0141", "RUSTSEC-2025-0134"]
 
 [bans]
 multiple-versions = "warn"
@@ -23,6 +28,9 @@ allow = [
   "Unicode-3.0",
   "Zlib",
   "CDLA-Permissive-2.0",
+  # tiny-keccak 2.0.2 (transitive via blake3) is CC0-1.0 — public-domain
+  # equivalent, permissive in every practical sense. Reviewed 2026-11.
+  "CC0-1.0",
 ]
 
 [sources]
