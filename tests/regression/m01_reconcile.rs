@@ -108,6 +108,9 @@ fn hash_of(seed: u8) -> [u8; 32] {
 
 #[tokio::test]
 async fn reconcile_reclaims_register_without_manifest() {
+    // Recorder FIRST: increments before installation are dropped, and the
+    // series assertion below must not depend on other tests' ordering.
+    file_storage::metrics::init_recorder();
     let rig = rig(0);
     let hash = hash_of(1);
     let data = vec![1u8; 256];
@@ -133,7 +136,6 @@ async fn reconcile_reclaims_register_without_manifest() {
     );
     let meta = rig.index.get_chunk_meta(&hash).await.unwrap();
     assert!(meta.is_none(), "leaked row must be finalized away");
-    file_storage::metrics::init_recorder();
     let render = file_storage::metrics::render();
     assert!(
         render.contains("file_storage_gc_reconcile_leaked_total"),
