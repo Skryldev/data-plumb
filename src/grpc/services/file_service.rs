@@ -162,6 +162,11 @@ impl FileService for FileServiceImpl {
                 match msg.payload {
                     Some(pb::upload_chunk::Payload::Data(data)) => {
                         seen += data.len() as u64;
+                        // V6-02: charge() is a no-op for DECLARED leases
+                        // (expected_size reserved the budget once at
+                        // admission); unknown-size leases charge here as
+                        // they stream. Over-streaming a declared lease is
+                        // rejected by the `seen > exp` check below.
                         // Take-charge-put: the mutex guard is dropped
                         // before any await point (std Mutex is not Send).
                         let charge_result = {
