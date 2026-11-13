@@ -93,6 +93,7 @@ pub async fn download_file(
     Extension(ctx): Extension<AuthContext>,
     Path(file_id): Path<Uuid>,
     headers: HeaderMap,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
 ) -> Result<Response, StorageError> {
     let manifest = state.0.retrieval.manifest(&file_id).await?;
     check_file_access(&ctx, &manifest.tenant_id)?;
@@ -103,7 +104,7 @@ pub async fn download_file(
         .and_then(|v| v.to_str().ok())
     {
         if http_cache::if_none_match_matches(inm, &etag) {
-            audit_download(&state, &ctx, &manifest.name, "304").await;
+            audit_download(&state, &ctx, &manifest.name, "304", &peer.ip().to_string()).await;
             return Ok((
                 StatusCode::NOT_MODIFIED,
                 [
@@ -125,7 +126,7 @@ pub async fn download_file(
         .retrieval
         .stream_full(m)
         .map(|r| r.map_err(map_stream_err));
-    audit_download(&state, &ctx, &name, "200").await;
+    audit_download(&state, &ctx, &name, "200", &peer.ip().to_string()).await;
     crate::metrics::record_download(started.elapsed().as_secs_f64(), "ok", size, "mixed");
     Ok(build_stream_response(StatusCode::OK, &mime, &name, size, &etag, stream).await)
 }
@@ -136,6 +137,7 @@ pub async fn download_range(
     Extension(ctx): Extension<AuthContext>,
     Path(file_id): Path<Uuid>,
     headers: HeaderMap,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
 ) -> Result<Response, StorageError> {
     let manifest = state.0.retrieval.manifest(&file_id).await?;
     check_file_access(&ctx, &manifest.tenant_id)?;
@@ -171,7 +173,7 @@ pub async fn download_range(
         .retrieval
         .stream_range(m, br.start, br.end + 1)
         .map(|r| r.map_err(map_stream_err));
-    audit_download(&state, &ctx, &name, "206").await;
+    audit_download(&state, &ctx, &name, "206", &peer.ip().to_string()).await;
 
     let started = std::time::Instant::now();
     let mut resp = build_stream_response(
@@ -287,14 +289,21 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
-async fn audit_download(state: &AppState, ctx: &AuthContext, name: &str, status: &str) {
+async fn audit_download(
+    state: &AppState,
+    ctx: &AuthContext,
+    name: &str,
+    status: &str,
+    peer_ip: &str,
+) {
+    // M-10: real actor + peer IP (was Actor::User + empty ip).
     AuditLog::new(state.0.index.clone())
         .record(
             AuditAction::Download,
             Actor::User(ctx.username.clone()),
             Some(ctx.tenant_id),
             name,
-            "",
+            peer_ip,
             status,
             "",
         )

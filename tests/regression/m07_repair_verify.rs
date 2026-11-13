@@ -122,7 +122,15 @@ async fn upload(
     state
         .0
         .pipeline
-        .process(tenant(), name, "application/octet-stream", vec![], stream)
+        .process(
+            tenant(),
+            name,
+            "application/octet-stream",
+            vec![],
+            stream,
+            "test",
+            "127.0.0.1",
+        )
         .await
         .unwrap()
         .manifest
