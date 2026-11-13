@@ -63,6 +63,11 @@ impl FileService for FileServiceImpl {
             return Err(Status::resource_exhausted("tenant rate limit exceeded"));
         }
         let request_id = request_id_of(&request);
+        // M-10: capture the peer BEFORE into_inner consumes the request.
+        let peer_ip = request
+            .remote_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_default();
         let mut inbound = request.into_inner();
 
         // 1. Header — must be exactly the first message.
@@ -213,11 +218,13 @@ impl FileService for FileServiceImpl {
 
         // 4. Same pipeline as REST: chunk → hash → compress → encrypt →
         //    store → commit manifest (single redb transaction).
+        // M-10: audit attribution carries the acting user + peer IP.
+        let actor = ctx.username.clone();
         let outcome = self
             .state
             .0
             .pipeline
-            .process(tenant_id, &name, &mime, tags, input)
+            .process(tenant_id, &name, &mime, tags, input, &actor, &peer_ip)
             .await
             .map_err(|e| status_from_error(&e))?;
 

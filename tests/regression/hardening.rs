@@ -1096,3 +1096,43 @@ async fn m09_internal_body_limit_route_scoped() {
         .unwrap();
     assert_eq!(resp.status(), 413, "public max_body must still cap uploads");
 }
+
+// -- M-10: audit rows attribute the real actor + peer IP ----------------------
+
+/// An upload's audit row must carry the acting username and the peer IP
+/// (was Actor::System with an empty ip — the trail couldn't answer "who
+/// uploaded this").
+#[tokio::test]
+async fn upload_audit_attributes_user_and_ip() {
+    let fx = spawn(file_storage::config::MetricsExposure::Loopback).await;
+    let token = admin_token(&fx.base).await;
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(format!("{}/api/v1/files?name=who.bin", fx.base))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/octet-stream")
+        .body(vec![9u8; 4096])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    // Admin lists the audit trail; the newest file.upload row names the
+    // actor and a loopback peer IP.
+    let audit = http
+        .get(format!("{}/api/v1/audit?limit=10", fx.base))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let rows = audit.as_array().unwrap();
+    let up = rows
+        .iter()
+        .find(|r| r["action"] == "file.upload" && r["object"] == "who.bin")
+        .expect("upload audit row present");
+    assert_eq!(up["actor"], "admin", "real actor, not 'system'");
+    assert_eq!(up["ip"], "127.0.0.1", "peer IP recorded (M-10), got: {up}");
+}

@@ -112,6 +112,7 @@ impl UploadPipeline {
     }
 
     /// Processes an entire upload stream into a committed manifest.
+    #[allow(clippy::too_many_arguments)] // M-10: actor + peer_ip join the lease-style param set
     pub async fn process<S>(
         &self,
         tenant_id: Uuid,
@@ -119,6 +120,8 @@ impl UploadPipeline {
         mime: &str,
         tags: Vec<String>,
         input: S,
+        actor: &str,
+        peer_ip: &str,
     ) -> Result<UploadOutcome, StorageError>
     where
         S: Stream<Item = Result<Bytes, StorageError>> + Unpin,
@@ -285,13 +288,15 @@ impl UploadPipeline {
             size_original.load(Ordering::Relaxed),
             dedup_bytes,
         );
+        // M-10: the audit trail answers "who uploaded this" — the acting
+        // user and their peer IP, not a System placeholder.
         self.audit
             .record(
                 AuditAction::Upload,
-                Actor::System,
+                Actor::User(actor.to_string()),
                 Some(tenant_id),
                 name,
-                "",
+                peer_ip,
                 "ok",
                 &format!(
                     "file_id={} chunks={} dedup={dedup_chunks}",

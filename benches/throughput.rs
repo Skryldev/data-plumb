@@ -76,6 +76,8 @@ fn bench_pipeline_upload(c: &mut Criterion) {
                     "application/octet-stream",
                     vec![],
                     stream,
+                    "bench",
+                    "127.0.0.1",
                 ))
                 .unwrap();
             black_box(outcome.manifest.size_original)
@@ -111,6 +113,8 @@ fn bench_retrieval(c: &mut Criterion) {
                 "application/octet-stream",
                 vec![],
                 stream,
+                "bench",
+                "127.0.0.1",
             ))
             .unwrap();
         outcome.manifest.file_id

@@ -75,13 +75,19 @@ async fn soak_upload_delete_gc_reconcile_loop() {
                 let outcome = state
                     .0
                     .pipeline
-                    .process(tenant, &name, "application/octet-stream", vec![], {
+                    .process(
+                        tenant,
+                        &name,
+                        "application/octet-stream",
+                        vec![],
                         // stream::iter is Unpin (unlike once(async { .. })) —
                         // matches UploadPipeline's `S: Stream + Unpin` bound.
                         futures::stream::iter(vec![Ok::<_, file_storage::error::StorageError>(
                             bytes::Bytes::from(payload),
-                        )])
-                    })
+                        )]),
+                        "soak",
+                        "127.0.0.1",
+                    )
                     .await;
                 assert!(
                     outcome.is_ok(),

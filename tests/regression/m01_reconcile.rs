@@ -407,6 +407,8 @@ async fn reconcile_admin_trigger_audited() {
             "application/octet-stream",
             vec![],
             stream,
+            "test",
+            "127.0.0.1",
         )
         .await
         .unwrap();

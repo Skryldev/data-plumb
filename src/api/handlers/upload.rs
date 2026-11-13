@@ -1,7 +1,7 @@
 //! `POST /api/v1/files` — multipart or raw-body upload.
 
 use axum::body::Body;
-use axum::extract::{FromRequest, Query, Request, State};
+use axum::extract::{ConnectInfo, FromRequest, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Extension;
@@ -29,6 +29,7 @@ pub async fn upload_file(
     Extension(ctx): Extension<AuthContext>,
     Query(q): axum::extract::Query<UploadQuery>,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     request: Request<Body>,
 ) -> Result<impl IntoResponse, StorageError> {
     check_write(&ctx)?;
@@ -78,9 +79,9 @@ pub async fn upload_file(
     // charge streamed bytes (unknown-size leases) and enforce max_body;
     // it is released at the handler's return (success/error/panic).
     let result = if content_type.starts_with(MULTIPART) {
-        upload_multipart(state, ctx, q, request, lease).await
+        upload_multipart(state, ctx, q, request, lease, peer).await
     } else {
-        upload_raw(state, ctx, q, content_type, request, lease).await
+        upload_raw(state, ctx, q, content_type, request, lease, peer).await
     };
     result
 }
@@ -108,6 +109,7 @@ async fn upload_raw(
     declared_ct: String,
     request: Request<Body>,
     mut lease: crate::core::gate::GateLease,
+    peer: std::net::SocketAddr,
 ) -> Result<axum::response::Response, StorageError> {
     let name = q
         .name
@@ -180,7 +182,15 @@ async fn upload_raw(
     let outcome = state
         .0
         .pipeline
-        .process(ctx.tenant_id, &name, &mime, tags, stream)
+        .process(
+            ctx.tenant_id,
+            &name,
+            &mime,
+            tags,
+            stream,
+            &ctx.username,
+            &peer.ip().to_string(),
+        )
         .await?;
     Ok((
         StatusCode::CREATED,
@@ -195,6 +205,7 @@ async fn upload_multipart(
     q: UploadQuery,
     request: Request<Body>,
     mut lease: crate::core::gate::GateLease,
+    peer: std::net::SocketAddr,
 ) -> Result<axum::response::Response, StorageError> {
     use axum::extract::multipart::Multipart;
 
@@ -309,7 +320,15 @@ async fn upload_multipart(
     let outcome = state
         .0
         .pipeline
-        .process(ctx.tenant_id, &name, &mime, tag_list, stream)
+        .process(
+            ctx.tenant_id,
+            &name,
+            &mime,
+            tag_list,
+            stream,
+            &ctx.username,
+            &peer.ip().to_string(),
+        )
         .await?;
     Ok((
         StatusCode::CREATED,
