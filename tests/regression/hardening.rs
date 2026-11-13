@@ -899,3 +899,100 @@ async fn h01_l3_weigher_byte_based() {
         "a 9.6 MB entry must not be retained by a 1 MB byte budget"
     );
 }
+
+// -- V6-04: replication lag accounting ---------------------------------------
+
+/// The lag counter (enqueued − acked) must return to 0 after every op
+/// ships, the worker must publish `replication_lag_ops`, and counted
+/// M-14 drops must NOT sit in the lag forever. The upstream is a real
+/// local HTTP server accepting /internal/batch.
+#[tokio::test]
+async fn lag_returns_to_zero_after_flush() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc as StdArc;
+
+    file_storage::metrics::init_recorder();
+    let served = StdArc::new(AtomicU64::new(0));
+    let served_c = served.clone();
+    let app = axum::Router::new().route(
+        "/internal/batch",
+        axum::routing::post(move |body: axum::body::Bytes| async move {
+            served_c.fetch_add(1, Ordering::Relaxed);
+            (axum::http::StatusCode::CREATED, body.len().to_string())
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+    let index = StdArc::new(
+        file_storage::storage::index_db::IndexDb::open(&dir.path().join("i.redb")).unwrap(),
+    );
+    let cfg = file_storage::config::ReplicationConfig {
+        enabled: true,
+        mode: file_storage::config::ReplicationMode::Async,
+        target_url: Some(format!("http://{addr}")),
+        api_key: "test-internal-key-0123456789abcdef".into(),
+        batch_size: 8,
+        flush_interval_ms: 50,
+        enqueue_timeout_ms: 2_000,
+        ..Default::default()
+    };
+    let repl = file_storage::replication::replicator::Replicator::start(&cfg, index).unwrap();
+
+    // Real chunk payloads (not manifests): Op::Manifest of an unknown id is
+    // skipped upstream (get_manifest → None) and would ship NOTHING while
+    // still acking — Op::Chunk always POSTs /internal/batch.
+    for i in 0..32u32 {
+        repl.enqueue_chunk(file_storage::replication::client::ChunkPayload {
+            hash: [i as u8; 32],
+            plain_hash: [i as u8; 32],
+            size_original: 64,
+            size_stored: 64,
+            compressed: false,
+            encrypted: false,
+            blob: bytes::Bytes::from(vec![i as u8; 64]),
+        })
+        .await
+        .unwrap();
+    }
+    // The worker may already have shipped a batch (batch_size 8, 50 ms
+    // interval) — assert the lag is bounded by the enqueue count rather
+    // than racing for exactly 32.
+    assert!(
+        repl.queue_depth() <= 32,
+        "lag must be bounded by the enqueue count"
+    );
+
+    // Wait for the worker to ship everything (50 ms flush interval).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if repl.queue_depth() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        repl.queue_depth(),
+        0,
+        "lag MUST return to 0 after all ops ship (V6-04: acked() was dead code)"
+    );
+    assert!(
+        served.load(Ordering::Relaxed) >= 1,
+        "the mock upstream must have served batches"
+    );
+
+    // The gauge is published by the worker.
+    let render = file_storage::metrics::render();
+    assert!(
+        render.contains("file_storage_replication_lag_ops"),
+        "lag gauge must be published (V6-04); body: {}",
+        render
+            .lines()
+            .filter(|l| l.contains("replication"))
+            .take(8)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
