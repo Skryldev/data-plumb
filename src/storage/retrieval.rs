@@ -188,8 +188,46 @@ impl RetrievalEngine {
         // 1. Fetch bytes from upstream. UNTRUSTED until verified.
         let blob = self.replicator.fetch_blob(&cr.hash).await?;
 
-        // 2. Can we verify? Plaintext chunks always; encrypted chunks only
-        //    when this node holds the tenant key (encryption enabled).
+        // 2. Can we verify? Plaintext chunks always; encrypted chunks when
+        //    encryption is ON and the tenant key file is PRESENT (V6-09: a
+        //    missing key file is a LOCAL misconfiguration, not hostile
+        //    upstream bytes — quarantine would pollute evidence with valid
+        //    ciphertext and misattribute the failure to the peer).
+        //    Encryption disabled + encrypted chunk = the documented
+        //    ciphertext-only posture (operator opt-out; legacy order).
+        if cr.encrypted {
+            match &self.encryptor {
+                None => {
+                    // (d) ciphertext-only posture (unchanged from M-07).
+                    metrics::record_repair_ciphertext_only();
+                    tracing::warn!(
+                        chunk_hash = %hex::encode(cr.hash),
+                        peer = %self.replicator.upstream_url().unwrap_or_default(),
+                        "repair without tenant key — verify-skipped (degraded posture)"
+                    );
+                    self.blocks.write(&cr.hash, &blob).await?;
+                    return Ok(blob);
+                }
+                Some(enc) if !enc.has_key(tenant) => {
+                    // (c) V6-09: key file missing = misconfiguration.
+                    metrics::record_repair_key_missing();
+                    tracing::error!(
+                        chunk_hash = %hex::encode(cr.hash),
+                        peer = %self.replicator.upstream_url().unwrap_or_default(),
+                        "tenant key file MISSING — repair unverified; NOT quarantining                          (this is a local config error, not hostile upstream bytes)"
+                    );
+                    // Nothing is persisted (no CAS, no L2): the bytes are
+                    // merely unverifiable-here. The caller sees a distinct
+                    // Encryption error (502 on the repair path) — retryable
+                    // once the operator restores the key file.
+                    return Err(StorageError::Encryption(format!(
+                        "repair key missing for tenant {tenant}: cannot verify chunk {}                          (restore the tenant key file; bytes NOT quarantined)",
+                        hex::encode(cr.hash)
+                    )));
+                }
+                Some(_) => {} // (b) keyed: verify below.
+            }
+        }
         let keyed = !cr.encrypted || self.encryptor.is_some();
         if !keyed {
             // Ciphertext-only posture: legacy order (persist-then-hope),

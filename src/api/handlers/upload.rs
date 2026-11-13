@@ -74,12 +74,14 @@ pub async fn upload_file(
     };
     let lease = lease;
 
+    // V6-11: the lease moves INTO the handler scope so the raw path can
+    // charge streamed bytes (unknown-size leases) and enforce max_body;
+    // it is released at the handler's return (success/error/panic).
     let result = if content_type.starts_with(MULTIPART) {
-        upload_multipart(state, ctx, q, request).await
+        upload_multipart(state, ctx, q, request, lease).await
     } else {
-        upload_raw(state, ctx, q, content_type, request).await
+        upload_raw(state, ctx, q, content_type, request, lease).await
     };
-    drop(lease);
     result
 }
 
@@ -105,6 +107,7 @@ async fn upload_raw(
     q: UploadQuery,
     declared_ct: String,
     request: Request<Body>,
+    mut lease: crate::core::gate::GateLease,
 ) -> Result<axum::response::Response, StorageError> {
     let name = q
         .name
@@ -136,10 +139,44 @@ async fn upload_raw(
     };
     validate_upload(&view, &state.0.cfg.limits)?;
 
+    // M-09-follow (V6-11): DefaultBodyLimit does not abort a raw body
+    // consumed via into_data_stream (it only caps axum's own buffering —
+    // multipart respected it, raw streaming did not). Enforce `max_body`
+    // (and charge the H-01 lease for unknown-size requests) WHILE
+    // streaming: the first byte past the cap aborts with 413.
+    let max_body = state.0.cfg.limits.max_body as u64;
+    let declared = lease.is_declared();
     let stream = request
         .into_body()
         .into_data_stream()
-        .map(|r| r.map_err(map_body_err));
+        .map(|r: Result<bytes::Bytes, axum::Error>| r.map_err(map_body_err))
+        .scan(0u64, move |streamed, item| {
+            let item = item.and_then(|chunk| {
+                *streamed += chunk.len() as u64;
+                if *streamed > max_body {
+                    return Err(StorageError::TooLarge(format!(
+                        "raw body exceeded max_body ({max_body} bytes)"
+                    )));
+                }
+                // V6-11: unknown-size leases charge as they stream (a
+                // declared lease already reserved its full size — the
+                // V6-02 no-double-charge contract). Known-size requests
+                // over `max_body` are still rejected here because the
+                // Content-Length pre-check cannot see chunked bodies.
+                if !declared {
+                    lease.charge(chunk.len() as u64).map_err(|_| {
+                        StorageError::TooLarge(
+                            "upload admission control: server upload byte budget exhausted".into(),
+                        )
+                    })?;
+                }
+                Ok(chunk)
+            });
+            futures::future::ready(Some(item))
+        });
+    // The lease lives inside the stream's scan closure and drops when the
+    // stream drops (process() consumes it to completion — or the error
+    // path drops the stream, releasing the reservation either way).
     let outcome = state
         .0
         .pipeline
@@ -157,6 +194,7 @@ async fn upload_multipart(
     ctx: AuthContext,
     q: UploadQuery,
     request: Request<Body>,
+    mut lease: crate::core::gate::GateLease,
 ) -> Result<axum::response::Response, StorageError> {
     use axum::extract::multipart::Multipart;
 
@@ -205,7 +243,7 @@ async fn upload_multipart(
             }
             "file" => {
                 file_mime = field.content_type().map(|s| s.to_string());
-                let (tmp, size) = spool_field(&state, field).await?;
+                let (tmp, size) = spool_field(&state, field, &mut lease).await?;
                 spooled = Some((tmp, size));
             }
             _ => {
@@ -285,6 +323,7 @@ async fn upload_multipart(
 async fn spool_field(
     state: &AppState,
     mut field: axum::extract::multipart::Field<'_>,
+    lease: &mut crate::core::gate::GateLease,
 ) -> Result<(tempfile::NamedTempFile, u64), StorageError> {
     let tmp = tempfile::NamedTempFile::new_in(&state.0.cfg.storage.temp_dir)
         .map_err(StorageError::from)?;
@@ -296,6 +335,13 @@ async fn spool_field(
         while let Some(chunk) = field.chunk().await.map_err(StorageError::from)? {
             written += chunk.len() as u64;
             state.0.validator.validate_size(written)?;
+            // V6-11: multipart file fields charge the byte budget as they
+            // stream (declared leases no-op per the V6-02 contract).
+            lease.charge(chunk.len() as u64).map_err(|_| {
+                StorageError::TooLarge(
+                    "upload admission control: server upload byte budget exhausted".into(),
+                )
+            })?;
             out.write_all(&chunk).await.map_err(StorageError::from)?;
         }
         out.flush().await.map_err(StorageError::from)?;

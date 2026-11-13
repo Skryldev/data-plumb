@@ -996,3 +996,103 @@ async fn lag_returns_to_zero_after_flush() {
             .join("\n")
     );
 }
+
+// -- M-09: /internal route-scoped body limit ---------------------------------
+
+/// The /internal body ceiling is independent of the public `max_body`:
+/// a config with max_body = 1 MiB and internal_body = 8 MiB must accept
+/// an internal bundle of ~2 MiB (a >max_body body) while the public
+/// upload cap stays 1 MiB. Verifies the route-scoped layer ordering
+/// (the route layer must OVERRIDE the outer DefaultBodyLimit, not be
+/// clipped by it).
+#[tokio::test]
+async fn m09_internal_body_limit_route_scoped() {
+    let dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+    let mut cfg = AppConfig::for_tests();
+    cfg = cfg.with_data_root(dir.path());
+    cfg.limits.max_body = 1024 * 1024; // 1 MiB public cap
+    cfg.limits.internal_body = 8 * 1024 * 1024; // 8 MiB internal cap
+    let state = file_storage::state::build_state(Arc::new(cfg))
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = file_storage::api::router::build_router(state.clone());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    let http = reqwest::Client::new();
+    // Login with status visibility (the generic helper hides non-JSON
+    // error bodies; a misconfigured fixture must fail loudly here).
+    let login = http
+        .post(format!("{base}/api/v1/auth/login"))
+        .json(&serde_json::json!({"username":"admin","password":"admin123"}))
+        .send()
+        .await
+        .unwrap();
+    let status = login.status();
+    assert_eq!(
+        status,
+        200,
+        "login must succeed: {}",
+        login.text().await.unwrap_or_default()
+    );
+    let token = login.json::<serde_json::Value>().await.unwrap()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 1. An internal bundle of ~2 MiB (over max_body, under internal_body):
+    //    a msgpack manifest with no chunks — small, wrapped in the bundle
+    //    framing with padding via the batch section (2 MiB of zero chunks
+    //    is invalid; instead push a manifest-only bundle plus a valid
+    //    empty batch). The KEY assertion: it is not rejected by 413.
+    let manifest = file_storage::storage::manifest::Manifest {
+        file_id: uuid::Uuid::now_v7(),
+        name: "bundle.bin".into(),
+        tenant_id: "01930000-0000-7000-8000-000000000001".parse().unwrap(),
+        mime: "application/octet-stream".into(),
+        size_original: 1,
+        size_stored: 1,
+        original_hash: [1u8; 32],
+        chunks: vec![],
+        tags: vec![],
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        deleted_at_ms: None,
+        version: 1,
+    };
+    let payload = file_storage::replication::client::encode_file_bundle(&manifest, &[]).unwrap();
+    let resp = http
+        .post(format!("{base}/internal/file/{}", manifest.file_id))
+        .header("X-Api-Key", "test-internal-key-0123456789abcdef")
+        .header("Content-Type", "application/octet-stream")
+        .body(payload)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status(),
+        413,
+        "an internal bundle under internal_body must not be clipped by max_body"
+    );
+
+    // 2. The PUBLIC cap still applies: a 2 MiB raw upload (over max_body
+    //    1 MiB) is rejected 413.
+    let resp = http
+        .post(format!("{base}/api/v1/files?name=over.bin"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/octet-stream")
+        .body(vec![7u8; 2 * 1024 * 1024])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413, "public max_body must still cap uploads");
+}

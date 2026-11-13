@@ -66,7 +66,11 @@ pub fn build_router(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             mw::auth::api_key_middleware,
-        ));
+        ))
+        // M-09: ROUTE-SCOPED body limit — replication bundles (full
+        // manifest + chunk set) must not be clipped by the public
+        // `max_body` cap (the V6 audit's silent-413 on resync/pull).
+        .layer(DefaultBodyLimit::max(state.0.cfg.limits.internal_body));
 
     let (set_request_id, propagate_request_id) = mw::request_id::build_request_id_layers();
 
