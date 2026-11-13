@@ -83,7 +83,7 @@ async fn h02_multipart_oversize_name_rejected_fast() {
     // 256 MiB body would dominate any in-process probe — the allocation
     // BOUND is asserted structurally by h02_bounded_reader_allocates_at_most_max.)
     let body = multipart_body(&[("name", vec![b'x'; 256 * 1024 * 1024])]);
-    let resp = tokio::time::timeout(
+    let sent = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         http.post(format!("{}/api/v1/files", fx.base))
             .header("Authorization", format!("Bearer {token}"))
@@ -92,9 +92,33 @@ async fn h02_multipart_oversize_name_rejected_fast() {
             .send(),
     )
     .await
-    .expect("rejection must be fast — the server aborts at the cap, not after the body")
-    .unwrap();
-    assert_eq!(resp.status(), 413, "oversize name must 413");
+    .expect("rejection must be fast — the server aborts at the cap, not after the body");
+    // Early-reject semantics are transport-tolerant: with the body still in
+    // flight the server may answer 413 or abort the connection (some
+    // loopback stacks deliver RST before the response bytes). Either
+    // outcome proves the server stopped at the cap; a small over-cap
+    // request then asserts the deterministic 413.
+    match sent {
+        Ok(resp) => assert_eq!(resp.status(), 413, "oversize name must 413"),
+        Err(e) => assert!(
+            e.is_connect() || e.is_request(),
+            "unexpected error class for early abort: {e}"
+        ),
+    }
+    let small = multipart_body(&[("name", vec![b'x'; 8 * 1024])]);
+    let resp = http
+        .post(format!("{}/api/v1/files", fx.base))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "multipart/form-data; boundary=pocbound")
+        .body(small)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        413,
+        "small over-cap name must 413 deterministically"
+    );
 }
 
 #[tokio::test]
@@ -103,15 +127,34 @@ async fn h02_multipart_unknown_field_capped() {
     let token = admin_token(&fx.base).await;
     let http = reqwest::Client::new();
     let body = multipart_body(&[("sneaky", vec![b'z'; 64 * 1024 * 1024])]);
-    let resp = http
+    let sent = http
         .post(format!("{}/api/v1/files", fx.base))
         .header("Authorization", format!("Bearer {token}"))
         .header("Content-Type", "multipart/form-data; boundary=pocbound")
         .body(body)
         .send()
+        .await;
+    match sent {
+        Ok(resp) => assert_eq!(resp.status(), 413, "unknown oversize field must 413"),
+        Err(e) => assert!(
+            e.is_connect() || e.is_request(),
+            "unexpected error class for early abort: {e}"
+        ),
+    }
+    let small = multipart_body(&[("sneaky", vec![b'z'; 8 * 1024])]);
+    let resp = http
+        .post(format!("{}/api/v1/files", fx.base))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "multipart/form-data; boundary=pocbound")
+        .body(small)
+        .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 413, "unknown oversize field must 413");
+    assert_eq!(
+        resp.status(),
+        413,
+        "small over-cap unknown field must 413 deterministically"
+    );
 }
 
 #[tokio::test]
@@ -712,26 +755,44 @@ async fn h01_concurrent_uploads_under_budget_all_succeed() {
         let token = token.clone();
         let http = http.clone();
         handles.push(tokio::spawn(async move {
-            http.post(format!("{base}/api/v1/files?name=conc-{i}.bin"))
+            // Outcome classes for a budget-line rejection with a 1 MiB body
+            // still in flight: a 201, a 413 response, or a connection abort
+            // (some loopback stacks deliver RST before the response bytes —
+            // seen on Windows). All three prove the server stayed coherent;
+            // anything else is a bug.
+            let sent = http
+                .post(format!("{base}/api/v1/files?name=conc-{i}.bin"))
                 .header("Authorization", format!("Bearer {token}"))
                 .header("Content-Type", "application/octet-stream")
                 .body(vec![7u8; 1024 * 1024])
                 .send()
-                .await
-                .unwrap()
-                .status()
+                .await;
+            match sent {
+                Ok(resp) => {
+                    let status = resp.status();
+                    assert!(
+                        status == 201 || status == 413,
+                        "coherent outcomes only: {status}"
+                    );
+                    if status == 201 {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                Err(e) => {
+                    assert!(
+                        e.is_connect() || e.is_request(),
+                        "unexpected error class for mid-stream abort: {e}"
+                    );
+                    0
+                }
+            }
         }));
     }
     let mut created = 0;
     for h in handles {
-        let status = h.await.unwrap();
-        assert!(
-            status == 201 || status == 413,
-            "coherent outcomes only: {status}"
-        );
-        if status == 201 {
-            created += 1;
-        }
+        created += h.await.unwrap();
     }
     assert!(
         created >= 1,

@@ -84,8 +84,7 @@ impl BlockStore {
         }
         tokio::fs::rename(&tmp, &path).await.map_err(dbe)?;
         // fsync the directory so the rename survives crashes.
-        let d = tokio::fs::File::open(&dir).await.map_err(dbe)?;
-        d.sync_all().await.map_err(dbe)?;
+        fsync_dir(&dir).await?;
         Ok(true)
     }
 
@@ -103,8 +102,7 @@ impl BlockStore {
             f.sync_all().map_err(dbe)?;
         }
         std::fs::rename(&tmp, &path).map_err(dbe)?;
-        let d = std::fs::File::open(&dir).map_err(dbe)?;
-        d.sync_all().map_err(dbe)?;
+        fsync_dir_blocking(&dir)?;
         Ok(true)
     }
 
@@ -305,6 +303,49 @@ impl BlockStore {
         tokio::fs::remove_file(&probe).await.map_err(dbe)?;
         Ok(())
     }
+}
+
+/// Directory fsync so a rename survives a crash (POSIX durability).
+///
+/// Unix keeps exact semantics. Non-unix platforms (Windows) cannot fsync a
+/// directory handle (`FlushFileBuffers` needs write access we do not hold)
+/// — the call fails with `Access is denied (os error 5)`. Production runs
+/// the Linux image, where durability matters; on other platforms the
+/// rename itself is still atomic within the OS page cache and the fsync is
+/// skipped (M-13 portability discipline: explicit, logged once, never a
+/// silent error).
+async fn fsync_dir(dir: &Path) -> Result<(), StorageError> {
+    #[cfg(unix)]
+    {
+        let d = tokio::fs::File::open(dir).await.map_err(dbe)?;
+        d.sync_all().await.map_err(dbe)?;
+    }
+    #[cfg(not(unix))]
+    {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::debug!(
+                dir = %dir.display(),
+                "non-unix platform: directory fsync skipped (POSIX durability is a Linux-image concern)"
+            );
+        });
+        let _ = dir;
+    }
+    Ok(())
+}
+
+/// Blocking twin of [`fsync_dir`] (see its doc for the platform policy).
+fn fsync_dir_blocking(dir: &Path) -> Result<(), StorageError> {
+    #[cfg(unix)]
+    {
+        let d = std::fs::File::open(dir).map_err(dbe)?;
+        d.sync_all().map_err(dbe)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

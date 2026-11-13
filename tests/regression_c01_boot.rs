@@ -10,7 +10,13 @@ use std::time::Instant;
 fn c01_boot_refuses_default_yaml() {
     // Prefer the release binary (production profile semantics), fall back
     // to the debug binary — the shipped config fails validation either way.
-    let candidates = ["target/release/file-storage", "target/debug/file-storage"];
+    // EXE_SUFFIX keeps the probe portable (".exe" on Windows, "" elsewhere).
+    let suffix = std::env::consts::EXE_SUFFIX;
+    let candidates = [
+        format!("target/release/file-storage{suffix}"),
+        format!("target/debug/file-storage{suffix}"),
+    ];
+    let candidates: &[&str] = &[candidates[0].as_str(), candidates[1].as_str()];
     let bin = candidates
         .iter()
         .find(|p| std::path::Path::new(p).exists())
