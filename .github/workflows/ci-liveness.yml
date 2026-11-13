@@ -1,0 +1,85 @@
+name: ci-liveness
+# Rule 19 (V7): every load-bearing gate must be proven to actually FAIL on
+# broken input. This workflow deliberately breaks the input and asserts the
+# gate inverts. Green here means "the gate can still say no".
+on:
+  schedule:
+    - cron: '43 3 * * *'
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - 'scripts/check_no_handler_validation.sh'
+      - 'scripts/dashboard_smoke.sh'
+      - 'scripts/poc_expect_fail.sh'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  # V6-05 liveness: the c01-boot-gate must refuse a config carrying a
+  # shipped/known literal. If a broken config boots, the gate is broken.
+  c01-gate-inverts-on-broken-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bin file-storage
+      - name: build a BROKEN config (shipped jwt literal, real-length padding)
+        run: |
+          cp secrets/file-storage.yaml.example /tmp/broken.yaml
+          # Deliberate violation: a known shipped literal, padded to pass the
+          # length floor so ONLY the literal rule catches it.
+          sed -i 's|jwt_secret: "PASTE_openssl_rand_hex_32_HERE"|jwt_secret: "change-me-in-production-0123456789abcdef-000000"|' /tmp/broken.yaml
+          sed -i 's|jwt_secret: "PASTE_openssl_rand_hex_32_HERE"|x|' /tmp/broken.yaml || true
+          sed -i 's|api_key: "PASTE_openssl_rand_hex_24_HERE"|api_key: "internal-dev-api-key-change-me-000000"|' /tmp/broken.yaml
+          grep -E 'jwt_secret|api_key' /tmp/broken.yaml
+      - name: broken config MUST refuse to boot (gate inversion)
+        run: |
+          set +e
+          ./target/release/file-storage --config /tmp/broken.yaml > /tmp/broken-boot.txt 2>&1
+          code=$?
+          set -e
+          cat /tmp/broken-boot.txt || true
+          if [ "$code" -eq 0 ]; then
+            echo "LIVENESS FAILURE: broken config booted — c01-boot-gate cannot say no"
+            exit 1
+          fi
+          grep -qiE 'shipped/known literal|invalid configuration' /tmp/broken-boot.txt \
+            || { echo "LIVENESS FAILURE: refusal did not name the violation"; exit 1; }
+          echo "PASS: gate inverts on broken config (exit $code)"
+
+  # V6-13 liveness: the no-handler-validation rule must catch an actual
+  # violation placed where handlers live.
+  no-handler-validation-inverts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: plant a validation violation in a handler file
+        run: |
+          mkdir -p /tmp/viol
+          cat > src/api/handlers/violation_probe.rs <<'EOF'
+          //! CI liveness probe — intentionally contains validation logic.
+          //! This file is created and deleted by ci-liveness.yml ONLY.
+          pub fn probe(name: &str) -> bool {
+              if name.len() > 255 { false } else { true }
+          }
+          EOF
+          # wire it into the handlers module so the grep scan sees it
+          echo "pub mod violation_probe;" >> src/api/handlers/mod.rs
+      - name: rule MUST fail while the violation exists
+        run: |
+          if ./scripts/check_no_handler_validation.sh; then
+            rm -f src/api/handlers/violation_probe.rs
+            git checkout -- src/api/handlers/mod.rs 2>/dev/null || true
+            echo "LIVENESS FAILURE: no-handler-validation accepted a planted violation"
+            exit 1
+          fi
+          echo "PASS: rule caught the planted violation"
+      - name: cleanup
+        if: always()
+        run: |
+          rm -f src/api/handlers/violation_probe.rs
+          git checkout -- src/api/handlers/mod.rs 2>/dev/null || true
+          git status --porcelain | head -5
