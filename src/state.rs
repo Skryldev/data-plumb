@@ -222,55 +222,194 @@ pub async fn build_state(cfg: Arc<AppConfig>) -> Result<AppState, StorageError> 
     })))
 }
 
-/// M-06: removes stale `.tmp-*` blobs and spool files older than `min_age`.
-/// Returns the number of files removed. Walk errors on a missing dir are
-/// tolerated (fresh deployments have no spool dir yet).
+/// M-06 (V6-03 REPAIR): removes stale crash leftovers — `.tmp-*` blob
+/// writes, `*.gc-pending` claims, and multipart spool files — older than
+/// `min_age`. RECURSIVE: the blob artifacts live in SHARD subdirectories
+/// (`root/ab/cd/...`), which the old top-level `read_dir` never visited,
+/// so crash loops leaked full-size blob copies forever (V6-03) and the
+/// W1-C-03 boot-recovery claim was ineffective. The walk is bounded to
+/// `shard_depth + 2` levels (shard dirs + file level) plus the flat
+/// temp/quarantine dirs; a missing dir is tolerated (fresh deployments).
 async fn boot_sweep_tmp(
     cfg: &AppConfig,
     min_age: std::time::Duration,
 ) -> Result<u64, StorageError> {
-    use std::time::SystemTime;
-    let cutoff = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
+    let cutoff = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
         - min_age.as_millis() as i64;
-    let mut removed: u64 = 0;
-    async fn sweep_dir(dir: &std::path::Path, cutoff: i64, removed: &mut u64) {
-        let mut rd = match tokio::fs::read_dir(dir).await {
-            Ok(rd) => rd,
-            Err(_) => return,
-        };
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let path = entry.path();
-            if !path.is_dir() {
-                let name = path.file_name().map(|n| n.to_string_lossy().to_string());
-                // W1-C-03 barrier: claimed blobs (.gc-pending) orphaned by a
-                // crash between claim and delete/restore are pure garbage
-                // (their row was unreferenced at claim time).
-                let stale_by_name = name
-                    .map(|n| n.starts_with(".tmp-") || n.ends_with("gc-pending"))
-                    .unwrap_or(false);
-                let meta = match entry.metadata().await {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                let stale_by_age = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| (d.as_millis() as i64) < cutoff)
-                    .unwrap_or(false);
-                if stale_by_age
-                    && (stale_by_name || !dir.ends_with("blocks"))
-                    && tokio::fs::remove_file(&path).await.is_ok()
-                {
-                    *removed += 1;
-                }
+    // Blob tree: shard-depth-limited recursion, name-filtered (only crash
+    // artifacts are ever removed from the CAS — never live blobs).
+    let depth = cfg.storage.shard_depth as usize + 2;
+    // Runs on the blocking pool: the shard walk is sync fs work.
+    let root = cfg.storage.root.clone();
+    let temp = cfg.storage.temp_dir.clone();
+    // The count crosses the blocking-pool boundary via the JoinHandle —
+    // u64 is Copy, so mutating a captured copy would silently drop the
+    // count (this exact bug made the metric read 0).
+    let removed = tokio::task::spawn_blocking(move || {
+        let mut n = 0u64;
+        sweep_dir_blocking(&root, cutoff, &mut n, depth, true);
+        // Temp spool: flat dir, any stale file goes. NOTE: the quarantine
+        // dir is deliberately NOT swept here — `Quarantine::sweep_expired`
+        // owns it (with its own metric + retention policy) right after;
+        // a second sweep here would race it for the count.
+        sweep_dir_blocking(&temp, cutoff, &mut n, 1, false);
+        n
+    })
+    .await
+    .unwrap_or(0);
+    Ok(removed)
+}
+
+/// Recursive sweep helper. `cas_mode=true` restricts removal to crash
+/// artifacts by name (`.tmp-*`, `*.gc-pending`) so live blobs are never
+/// touched; `cas_mode=false` (temp/quarantine) removes any stale file.
+fn sweep_dir_blocking(
+    dir: &std::path::Path,
+    cutoff: i64,
+    removed: &mut u64,
+    depth_remaining: usize,
+    cas_mode: bool,
+) {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
+            if depth_remaining > 1 {
+                sweep_dir_blocking(&path, cutoff, removed, depth_remaining - 1, cas_mode);
             }
+            continue;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        // W1-C-03 barrier: claimed blobs (.gc-pending) orphaned by a crash
+        // between claim and delete/restore are pure garbage — their row was
+        // unreferenced at claim time (the resurrection re-check ran before
+        // the claim; a restored blob is renamed back to canonical, never
+        // left pending). Boot-time GC-pending files are therefore stale by
+        // construction: no upload can hold a live registration without the
+        // canonical path existing.
+        let stale_by_name = name.starts_with(".tmp-") || name.ends_with("gc-pending");
+        let stale_by_age = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| (d.as_millis() as i64) < cutoff)
+            .unwrap_or(false);
+        let stale = stale_by_age && (if cas_mode { stale_by_name } else { true });
+        if stale && std::fs::remove_file(&path).is_ok() {
+            *removed += 1;
         }
     }
-    sweep_dir(&cfg.storage.root, cutoff, &mut removed).await;
-    sweep_dir(&cfg.storage.temp_dir, cutoff, &mut removed).await;
-    Ok(removed)
+}
+
+#[cfg(test)]
+mod boot_sweep_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// V6-03 gate (planned in Wave 1, never landed): stale crash artifacts
+    /// in SHARD subdirectories must be swept at boot; fresh ones survive;
+    /// the metric counts exactly the swept files.
+    #[tokio::test]
+    async fn boot_sweeps_stale_tmp_in_shard_dirs() {
+        // Recorder FIRST: the sweep metric is recorded inside build_state.
+        crate::metrics::init_recorder();
+        let dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let mut cfg = AppConfig::for_tests();
+        cfg = cfg.with_data_root(dir.path());
+        // Plant the artifacts BEFORE build_state (the sweep runs inside it).
+        let shard = cfg.storage.root.join("ab").join("cd");
+        std::fs::create_dir_all(&shard).unwrap();
+        let stale_tmp = shard.join(".tmp-stale");
+        let stale_pending = shard.join(format!("{}.123.gc-pending", "a".repeat(64)));
+        let fresh_tmp = shard.join(".tmp-fresh");
+        std::fs::write(&stale_tmp, b"stale").unwrap();
+        std::fs::write(&stale_pending, b"claimed-blob").unwrap();
+        std::fs::write(&fresh_tmp, b"fresh").unwrap();
+        // Age the stale pair past orphan_min_age; leave the fresh one now.
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        for p in [&stale_tmp, &stale_pending] {
+            let f = std::fs::File::options().append(true).open(p).unwrap();
+            f.set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(old)
+                    .set_modified(old),
+            )
+            .unwrap();
+        }
+
+        // A stale spool file in temp_dir (non-CAS dir: any stale file goes).
+        let spool = cfg.storage.temp_dir.join("spool-leftover");
+        std::fs::create_dir_all(&cfg.storage.temp_dir).unwrap();
+        std::fs::write(&spool, b"spool").unwrap();
+        let f = std::fs::File::options().append(true).open(&spool).unwrap();
+        f.set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(old)
+                .set_modified(old),
+        )
+        .unwrap();
+
+        let state = build_state(Arc::new(cfg)).await.unwrap();
+
+        assert!(!stale_tmp.exists(), "stale .tmp in shard dir must be swept");
+        assert!(!stale_pending.exists(), "stale .gc-pending must be swept");
+        assert!(fresh_tmp.exists(), "fresh .tmp must survive");
+        assert!(!spool.exists(), "stale spool file must be swept");
+        // Metric (process-global recorder): the series must exist with a
+        // positive count — this boot swept >= 3 stale files.
+        let render = crate::metrics::render();
+        let line = render
+            .lines()
+            .find(|l| l.starts_with("file_storage_startup_tmp_swept_total"))
+            .expect("sweep metric must render");
+        let value: f64 = line
+            .rsplit(' ')
+            .next()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        assert!(
+            value >= 3.0,
+            "this boot swept 3 stale files; metric shows {value}: {line}"
+        );
+        let _ = state; // keep the server alive for the assertion window
+    }
+
+    /// CAS safety: a LIVE blob (canonical <hex>.bin in a shard dir) must
+    /// NEVER be swept even when old — only named crash artifacts go.
+    #[tokio::test]
+    async fn boot_sweep_never_touches_live_blobs() {
+        let dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let mut cfg = AppConfig::for_tests();
+        cfg = cfg.with_data_root(dir.path());
+        cfg.retention.orphan_min_age_secs = 0;
+        let blocks = crate::storage::block_store::BlockStore::new(cfg.storage.root.clone(), 2);
+        let h = [7u8; 32];
+        blocks.write(&h, b"live-blob").await.unwrap();
+        // Backdate the live blob itself.
+        let (_, path) = blocks.shard_path(&h);
+        let old = std::time::SystemTime::now() - Duration::from_secs(7200);
+        let f = std::fs::File::options().append(true).open(&path).unwrap();
+        f.set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(old)
+                .set_modified(old),
+        )
+        .unwrap();
+
+        let _state = build_state(Arc::new(cfg)).await.unwrap();
+        assert!(
+            path.exists(),
+            "live canonical blob must survive the boot sweep (CAS-mode name filter)"
+        );
+    }
 }

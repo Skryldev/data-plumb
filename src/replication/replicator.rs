@@ -39,13 +39,19 @@ pub struct Replicator {
     handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     client: Option<ReplicationClient>,
     cfg: ReplicationConfig,
-    /// M-02: lag = ops enqueued but not yet acked.
+    /// M-02/V6-04: lag = ops enqueued but not yet acked. Incremented by
+    /// every successful send (INCLUDING M-14 counted drops — an op the
+    /// server accepted-and-dropped still counts until we choose to treat
+    /// the drop as its own ack: see the timeout path, which decrements and
+    /// reports separately). Decremented by the worker after each shipped
+    /// batch via the shared handle.
     acked_lag: Arc<AtomicU64>,
 }
 
 impl Replicator {
     /// Builds the replicator and spawns the worker task when enabled.
     pub fn start(cfg: &ReplicationConfig, index: Arc<IndexDb>) -> Result<Arc<Self>, StorageError> {
+        let lag_handle = Arc::new(AtomicU64::new(0));
         let (tx, handle, client) = if cfg.enabled {
             let client = ReplicationClient::new(
                 cfg.target_url.as_deref().unwrap_or_default(),
@@ -59,18 +65,18 @@ impl Replicator {
                 index.clone(),
                 cfg.batch_size.max(1),
                 Duration::from_millis(cfg.flush_interval_ms.max(10)),
+                lag_handle.clone(),
             ));
             (Some(tx), Some(handle), Some(client))
         } else {
             (None, None, None)
         };
-        let lag = Arc::new(AtomicU64::new(0));
         Ok(Arc::new(Self {
             tx: tokio::sync::Mutex::new(tx),
             handle: tokio::sync::Mutex::new(handle),
             client,
             cfg: cfg.clone(),
-            acked_lag: lag.clone(),
+            acked_lag: lag_handle.clone(),
         }))
     }
 
@@ -92,6 +98,8 @@ impl Replicator {
         self.client.as_ref()
     }
 
+    /// M-02/V6-04: current lag = ops enqueued but not yet acked (shipped
+    /// ops decrement, drops decrement, the worker publishes the gauge).
     pub fn queue_depth(&self) -> u64 {
         self.acked_lag.load(Ordering::Relaxed)
     }
@@ -118,6 +126,11 @@ impl Replicator {
                         "replication worker stopped".into(),
                     )),
                     Err(_elapsed) => {
+                        // The op never shipped; it must not sit in the lag
+                        // forever (V6-04: the counter is enqueued-minus-
+                        // acked, and a dropped op is neither). The drop is
+                        // its own terminal state, counted separately.
+                        self.acked_lag.fetch_sub(1, Ordering::Relaxed);
                         metrics::record_replication_dropped(1);
                         tracing::error!(
                             timeout_ms = timeout.as_millis() as u64,
@@ -229,6 +242,7 @@ async fn worker_loop(
     index: Arc<IndexDb>,
     batch_size: usize,
     flush_interval: Duration,
+    lag: Arc<AtomicU64>,
 ) {
     let mut buf: Vec<Op> = Vec::with_capacity(batch_size.max(8));
     let mut backoff_idx = 0usize;
@@ -265,7 +279,20 @@ async fn worker_loop(
                     continue;
                 }
                 Ok(None) => {
-                    let _ = flush_batch(&mut buf, &client, &index).await;
+                    // Channel closed (shutdown): the final flush still acks
+                    // whatever ships (V6-04); failures are logged, never
+                    // silently dropped — the lag gauge keeps the residue.
+                    match flush_batch(&mut buf, &client, &index).await {
+                        Ok(n) => {
+                            metrics::record_replication_acked(n as u64);
+                            lag.fetch_sub(n as u64, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, ops = buf.len(),
+                                "final replication flush failed; ops remain in lag");
+                        }
+                    }
+                    metrics::set_replication_lag(lag.load(Ordering::Relaxed) as f64);
                     break;
                 }
                 Err(_) => {} // interval elapsed -> flush below
@@ -282,10 +309,16 @@ async fn worker_loop(
         // flush_batch returns the acked count.
         // M-02: shipped ops are "acked" for lag purposes; the worker owns
         // the lag counter via a plain subtraction (enqueued - shipped).
+        // V6-04: shipped ops are ACKED — decrement the lag and publish the
+        // gauge here (the worker is the single lag publisher; acked() on
+        // the handle stays for external callers/tests).
         let acked = result.as_ref().copied().unwrap_or(0);
         metrics::record_replication_acked(acked as u64);
+        if acked > 0 {
+            lag.fetch_sub(acked as u64, Ordering::Relaxed);
+        }
+        metrics::set_replication_lag(lag.load(Ordering::Relaxed) as f64);
         metrics::set_replication_queue_depth(buf.len() as f64);
-        let _ = acked;
 
         match result {
             Ok(_) => {
