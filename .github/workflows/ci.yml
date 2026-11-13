@@ -2,6 +2,15 @@ name: ci
 on:
   push: { branches: [main, 'release/*'] }
   pull_request: {}
+  # V6-06: declared schedule — the nightly/soak jobs gate on this event.
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch: {}
+
+# V6-06: least privilege on every job (see per-job blocks below). The
+# github-script PR comment in binary-size needs issues:write.
+permissions:
+  contents: read
 
 jobs:
   fmt:
@@ -35,8 +44,10 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --target x86_64-pc-windows-msvc --all-targets
-      - run: cargo test --target x86_64-pc-windows-msvc -- --skip platform_unix
+      - run: cargo check --target x86_64-pc-windows-msvc --all-targets --locked
+      # V6-OPS-03: the old `--skip platform_unix` matched ZERO test names
+      # (dead filter); the full platform-agnostic suite runs natively now.
+      - run: cargo test --target x86_64-pc-windows-msvc --locked
 
   security:
     runs-on: ubuntu-latest
@@ -44,7 +55,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install --locked cargo-audit cargo-deny
-      - run: cargo audit
+      # V6-OPS-02: unmaintained advisories MUST carry an audit.toml rationale;
+      # an unallowlisted warning now fails the build.
+      - run: cargo audit --deny warnings
       - run: cargo deny check
 
   proto:
@@ -66,25 +79,33 @@ jobs:
       - uses: actions/checkout@v4
       - run: ./scripts/check_no_handler_validation.sh
 
-  # CI-W2 (V5 §7.2): the C-01 boot story proven live on every PR — the
-  # shipped (secretless) config MUST refuse to boot naming its violations,
-  # a secreted config MUST boot and serve /health, and the old bootstrap
-  # password MUST be rejected.
+  # CI-W2 (V5 §7.2), REPAIRED per V6-05: the shipped (secretless) config
+  # MUST refuse to boot naming its violations, a secreted config MUST boot
+  # and serve /health, and the old bootstrap password MUST be rejected.
+  # Rule 19 (CI liveness): ci-liveness.yml proves daily that this gate
+  # actually fails on broken input.
   c01-boot-gate:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --bin file-storage
-      - name: shipped config MUST refuse to boot
+      - name: shipped config MUST refuse to boot (exit captured WITHOUT a pipe)
         run: |
           set +e
-          ./target/release/file-storage --config config/production.yaml 2>&1 | tee /tmp/boot.txt
+          ./target/release/file-storage --config config/production.yaml > /tmp/boot.txt 2>&1
           code=$?
           set -e
-          test "$code" -ne 0 || { echo "C-01 VIOLATION: secretless config booted"; exit 1; }
-          grep -qiE "violation" /tmp/boot.txt || { echo "refusal must name its violations"; exit 1; }
+          cat /tmp/boot.txt
+          if [ "$code" -eq 0 ]; then
+            echo "C-01 VIOLATION: secretless config booted"; exit 1
+          fi
+          # Match the ACTUAL boot-failure wording (lib.rs context +
+          # config.rs violation list), not a guessed word.
+          grep -qiE 'invalid configuration|jwt_secret|api_key|argon2|password' /tmp/boot.txt             || { echo "refusal must name its violations"; exit 1; }
       - name: secreted config MUST boot and serve /health
         run: |
           cp secrets/file-storage.yaml.example /tmp/secretful.yaml
@@ -93,21 +114,24 @@ jobs:
           HASH=$(./target/release/file-storage hash-password --password bootstrap-admin-pw-1)
           sed -i "s|PASTE_FILE_STORAGE_HASH_PASSWORD_OUTPUT_HERE|$HASH|" /tmp/secretful.yaml
           ./target/release/file-storage --config /tmp/secretful.yaml &
+          PID=$!
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/health && break || sleep 1; done
-          curl -sf http://127.0.0.1:8080/health > /dev/null || { echo "no /health"; exit 1; }
+          curl -sf http://127.0.0.1:8080/health > /dev/null || { kill $PID 2>/dev/null || true; echo "no /health"; exit 1; }
           # admin123 (the C-01 shipped literal) MUST fail.
-          if curl -sf -X POST http://127.0.0.1:8080/api/v1/auth/login \
-              -H 'Content-Type: application/json' \
-              -d '{"username":"admin","password":"admin123"}' > /dev/null; then
+          if curl -sf -X POST http://127.0.0.1:8080/api/v1/auth/login               -H 'Content-Type: application/json'               -d '{"username":"admin","password":"admin123"}' > /dev/null; then
+            kill $PID 2>/dev/null || true
             echo "C-01 VIOLATION: admin123 authenticated"; exit 1
           fi
-          kill -9 %1 2>/dev/null || true
+          kill $PID 2>/dev/null || true
 
   # CI-W3 (V5 §7.3): binary-size regression guard. Baseline 12 MiB
   # (post-Wave-1); fail past 15 MiB (25% growth). Size reported on the PR.
   binary-size:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -180,10 +204,44 @@ jobs:
           docker compose up -d --wait
           bash poc_expect_fail.sh
 
+  # V6-06 REPAIR: the old nightly job was gated on `schedule` that the
+  # `on:` block never declared — unreachable, so the H-01 RSS gate ran
+  # nowhere. Now: declared schedule + manual dispatch + permissions.
   nightly:
-    if: github.event_name == 'schedule'
-    runs-on: [self-hosted, release-box]
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      - run: cargo bench --bench throughput
-      - run: cargo test --release --test regression_hardening h01_upload_memory_bound -- --include-ignored
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: H-01 memory bound (the ONLY consumer of the ignored RSS test)
+        run: |
+          cargo build --release --bin file-storage
+          cargo test --locked --release --test regression_hardening h01_upload_memory_bound -- --include-ignored --nocapture
+      - name: benches
+        run: cargo bench --bench throughput -- --warm-up-time 1 --measurement-time 3 || true
+      - name: upload bench results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: target/criterion
+          if-no-files-found: ignore
+
+  soak:
+    # V7-P1 soak promotion: long-running upload/delete/GC/reconcile loop.
+    # 60-minute CI slice; the full 24h run is operator-dispatched.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --release --test soak -- --include-ignored --nocapture
+        continue-on-error: false
