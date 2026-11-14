@@ -178,6 +178,24 @@ pub struct ThrottleConfig {
     pub lockout_cap_ms: u64,
     /// Bound on tracked usernames (oldest-evicted, never wholesale-cleared).
     pub map_capacity: u64,
+    /// V6-15: per-IP lockout cap. LONGER than the per-username cap so an
+    /// attacker cannot wait out the IP window while a victim's username
+    /// entry TTLs.
+    #[serde(default = "default_ip_lockout_cap_ms")]
+    pub ip_lockout_cap_ms: u64,
+    /// V6-15: bound on tracked IPs (own capacity — not shared with the
+    /// per-username map, so IP floods cannot evict user entries faster
+    /// than their own TTL anyway).
+    #[serde(default = "default_ip_map_capacity")]
+    pub ip_map_capacity: u64,
+}
+
+fn default_ip_lockout_cap_ms() -> u64 {
+    60 * 60 * 1_000 // 1 h (username cap: 15 min)
+}
+
+fn default_ip_map_capacity() -> u64 {
+    20_000
 }
 
 impl Default for ThrottleConfig {
@@ -188,6 +206,8 @@ impl Default for ThrottleConfig {
             multiplier: 2.0,
             lockout_cap_ms: 15 * 60 * 1_000,
             map_capacity: 10_000,
+            ip_lockout_cap_ms: 60 * 60 * 1_000,
+            ip_map_capacity: 20_000,
         }
     }
 }

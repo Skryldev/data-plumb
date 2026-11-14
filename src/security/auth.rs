@@ -139,8 +139,18 @@ impl AuthService {
     ///    not lock out its user);
     /// 3. `InvalidCredentials` records a throttle failure;
     /// 4. success resets the backoff.
-    pub fn login(&self, username: &str, password: &str) -> Result<TokenPair, StorageError> {
+    pub fn login(
+        &self,
+        username: &str,
+        password: &str,
+        peer_ip: Option<std::net::IpAddr>,
+    ) -> Result<TokenPair, StorageError> {
+        // V6-15: BOTH ladders gate entry (username + peer IP), each
+        // fail-open, each before the argon2 verify.
         self.throttle.check(username)?;
+        if let Some(ip) = peer_ip {
+            self.throttle.check_ip(ip)?;
+        }
         let user = self.users.iter().find(|u| u.username == username);
         let verify = match user {
             Some(u) => self.verify_password(u, password),
@@ -160,10 +170,16 @@ impl AuthService {
         let ok = verify?;
         if !ok {
             self.throttle.record_failure(username);
+            if let Some(ip) = peer_ip {
+                self.throttle.record_failure_ip(ip);
+            }
             return Err(StorageError::Unauthorized("invalid credentials".into()));
         }
         let user = user.expect("checked above");
         self.throttle.record_success(username);
+        if let Some(ip) = peer_ip {
+            self.throttle.record_success_ip(ip);
+        }
         Ok(self.issue_pair(&user.username, user.tenant_id, user.role))
     }
 
@@ -330,7 +346,7 @@ mod tests {
     #[test]
     fn login_success_and_claims() {
         let (svc, tenant) = service();
-        let pair = svc.login("alice", "wonderland").unwrap();
+        let pair = svc.login("alice", "wonderland", None).unwrap();
         let ctx = svc.verify_access(&pair.access_token).unwrap();
         assert_eq!(ctx.username, "alice");
         assert_eq!(ctx.tenant_id, tenant);
@@ -340,24 +356,24 @@ mod tests {
     #[test]
     fn argon2_hashed_user_can_login() {
         let (svc, _) = service();
-        let pair = svc.login("hashed", "argonpw").unwrap();
+        let pair = svc.login("hashed", "argonpw", None).unwrap();
         let ctx = svc.verify_access(&pair.access_token).unwrap();
         assert_eq!(ctx.role, Role::Viewer);
-        assert!(svc.login("hashed", "wrong").is_err());
+        assert!(svc.login("hashed", "wrong", None).is_err());
     }
 
     #[test]
     fn wrong_credentials_rejected() {
         let (svc, _) = service();
-        assert!(svc.login("alice", "nope").is_err());
-        assert!(svc.login("ghost", "nope").is_err());
-        assert!(svc.login("alice", "").is_err());
+        assert!(svc.login("alice", "nope", None).is_err());
+        assert!(svc.login("ghost", "nope", None).is_err());
+        assert!(svc.login("alice", "", None).is_err());
     }
 
     #[test]
     fn refresh_rotation() {
         let (svc, _) = service();
-        let p1 = svc.login("alice", "wonderland").unwrap();
+        let p1 = svc.login("alice", "wonderland", None).unwrap();
         assert_eq!(svc.active_sessions(), 1);
         let p2 = svc.refresh(&p1.refresh_token).unwrap();
         assert_eq!(svc.active_sessions(), 1, "old token rotated away");
@@ -368,7 +384,7 @@ mod tests {
     #[test]
     fn logout_invalidates() {
         let (svc, _) = service();
-        let p = svc.login("alice", "wonderland").unwrap();
+        let p = svc.login("alice", "wonderland", None).unwrap();
         assert!(svc.logout(&p.refresh_token));
         assert!(!svc.logout(&p.refresh_token));
         assert!(svc.refresh(&p.refresh_token).is_err());
@@ -377,7 +393,7 @@ mod tests {
     #[test]
     fn tampered_token_rejected() {
         let (svc, _) = service();
-        let p = svc.login("alice", "wonderland").unwrap();
+        let p = svc.login("alice", "wonderland", None).unwrap();
         let mut parts: Vec<String> = p.access_token.split('.').map(String::from).collect();
         parts[2].push('x');
         assert!(svc.verify_access(&parts.join(".")).is_err());
@@ -389,10 +405,10 @@ mod tests {
     fn role_gate_helpers() {
         let (svc, _) = service();
         let admin = svc
-            .verify_access(&svc.login("root", "rootpw").unwrap().access_token)
+            .verify_access(&svc.login("root", "rootpw", None).unwrap().access_token)
             .unwrap();
         let viewer = svc
-            .verify_access(&svc.login("hashed", "argonpw").unwrap().access_token)
+            .verify_access(&svc.login("hashed", "argonpw", None).unwrap().access_token)
             .unwrap();
         assert!(admin.require_admin().is_ok());
         assert!(admin.require_write().is_ok());
