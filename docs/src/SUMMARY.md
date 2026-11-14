@@ -64,7 +64,8 @@
 - [Troubleshooting](./operations/troubleshooting.md)
 - [Runbook](./operations/runbook.md)
 - [CI](./operations/ci.md)
-- [Wave 2 Report](./operations/wave2-report.md)
+- [Wave 2 Report](./operations/wave2-report.md
+      - [Wave 3 Report (V7)](operations/wave3-report.md))
 
 # Integration
 - [Rust Client](./integration/rust-client.md)
