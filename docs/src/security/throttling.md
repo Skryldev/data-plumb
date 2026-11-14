@@ -66,3 +66,18 @@ Semantics:
 `login_throttle_correct_password_inside_window_still_rejected`,
 `login_throttle_audited`, `throttle_map_evicts_oldest_not_clear`,
 `verifier_error_does_not_throttle`, `streaming_governor_matches_unary`.
+
+## Residual risks (V6-15 closure notes)
+
+* **Distributed-IP lockout DoS of a known username** — an attacker who
+  rotates across many IPs can still lock any known username for the
+  per-username cap (the rule-17 tradeoff: fail-open throttle, honest
+  users protected first). Operator mitigation: WAF / fail2ban at the
+  edge; a per-tenant aggregate ladder is a V8 candidate.
+* **IP-map churn** — a botnet can churn the 20k-entry IP map; oldest-
+  eviction only resets IPs whose ladder already expired (the cap is 1 h),
+  so sustained floods keep their own budget while churning.
+* **Shared-IP households** — a successful login clears the peer's IP
+  ladder (`record_success_ip`), so one bad actor behind a NAT does not
+  lock out the household permanently; the ladder re-forms on their next
+  failures.
