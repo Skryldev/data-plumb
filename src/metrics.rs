@@ -186,6 +186,15 @@ pub fn record_reconcile_leaked(n: u64) {
     }
 }
 
+pub const M_LOGIN_THROTTLE_LOCKED: &str = "file_storage_login_throttle_locked_total";
+
+/// M-05/V6-15: a login was refused by a throttle ladder. `dimension` is
+/// "user" or "ip" (NEVER the username/IP itself — label cardinality is
+/// bounded by design; the identity lives in the audit row).
+pub fn record_login_throttled(dimension: &str) {
+    metrics::counter!(M_LOGIN_THROTTLE_LOCKED, "dimension" => dimension.to_owned()).increment(1);
+}
+
 /// C-03: counts chunk registrations rejected because a racing GC/purge
 /// removed the blob between write and registration (expected ~0; alert if
 /// it grows steadily — it indicates uploads are repeatedly self-healing).

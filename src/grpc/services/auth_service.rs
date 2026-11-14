@@ -47,6 +47,8 @@ impl AuthService for AuthServiceImpl {
         &self,
         request: Request<pb::LoginRequest>,
     ) -> Result<Response<pb::LoginResponse>, Status> {
+        // V6-15: capture the peer BEFORE into_inner consumes the request.
+        let peer_ip = request.remote_addr().map(|a| a.ip());
         let req = request.into_inner();
         let username = req.username.trim().to_string();
         if username.is_empty() || req.password.is_empty() {
@@ -54,7 +56,7 @@ impl AuthService for AuthServiceImpl {
                 "username and password are required",
             ));
         }
-        match self.state.0.auth.login(&username, &req.password) {
+        match self.state.0.auth.login(&username, &req.password, peer_ip) {
             Ok(pair) => {
                 self.state
                     .0
@@ -72,6 +74,13 @@ impl AuthService for AuthServiceImpl {
                 Ok(Response::new(to_response(pair)))
             }
             Err(e @ crate::error::StorageError::Throttled(_)) => {
+                // V6-15: same metric discipline as REST (dimension only).
+                let dimension = if e.to_string().contains("for peer") {
+                    "ip"
+                } else {
+                    "user"
+                };
+                crate::metrics::record_login_throttled(dimension);
                 // M-05: lockout events are audited distinctly from plain
                 // credential failures, carrying the retry window.
                 self.state

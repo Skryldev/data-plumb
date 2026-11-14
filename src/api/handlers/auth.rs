@@ -21,9 +21,14 @@ fn to_dto(p: crate::security::auth::TokenPair) -> TokenPairDto {
 
 pub async fn login(
     State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, StorageError> {
-    match state.0.auth.login(&req.username, &req.password) {
+    match state
+        .0
+        .auth
+        .login(&req.username, &req.password, Some(peer.ip()))
+    {
         Ok(pair) => {
             state
                 .0
@@ -41,6 +46,15 @@ pub async fn login(
             Ok((StatusCode::OK, Json(to_dto(pair))))
         }
         Err(e @ StorageError::Throttled(_)) => {
+            // M-05/V6-15: the lockout event is audited AND metric'd — the
+            // dimension ("user"|"ip") is derived from the throttle message
+            // prefix; identities live in the audit row, never in labels.
+            let dimension = if e.to_string().contains("for peer") {
+                "ip"
+            } else {
+                "user"
+            };
+            crate::metrics::record_login_throttled(dimension);
             // M-05: the lockout event is its own audit action (distinct
             // from a plain credential failure) with the retry window.
             state

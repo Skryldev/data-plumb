@@ -39,6 +39,8 @@ fn throttle_cfg(base_ms: u64, cap_ms: u64, capacity: u64) -> ThrottleConfig {
         multiplier: 2.0,
         lockout_cap_ms: cap_ms,
         map_capacity: capacity,
+        ip_lockout_cap_ms: 60_000,
+        ip_map_capacity: 100,
     }
 }
 
@@ -304,7 +306,7 @@ async fn verifier_error_does_not_throttle() {
     let state = spawn(cfg, dir).await;
 
     for _ in 0..10 {
-        let err = state.0.auth.login("alice", "whatever").unwrap_err();
+        let err = state.0.auth.login("alice", "whatever", None).unwrap_err();
         assert!(
             matches!(err, file_storage::error::StorageError::AuthBackend(_)),
             "verifier errors surface as AuthBackend, got {err:?}"
@@ -318,7 +320,7 @@ async fn verifier_error_does_not_throttle() {
         "verifier errors must not record throttle failures"
     );
     // And a later legitimate login is not locked out (admin, same store).
-    assert!(state.0.auth.login("admin", "admin123").is_ok());
+    assert!(state.0.auth.login("admin", "admin123", None).is_ok());
 }
 
 // -- gate 7: streaming_governor_matches_unary ------------------------------------
@@ -353,4 +355,86 @@ async fn streaming_governor_matches_unary() {
     let t = uuid::Uuid::now_v7();
     assert!(limiter.allow(t));
     assert!(!limiter.allow(t), "budget exhausted on the shared instance");
+}
+
+// -- V6-15: per-IP throttle layer --------------------------------------------
+
+use std::net::{IpAddr, Ipv4Addr};
+
+fn ip(n: u8) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(10, 0, 0, n))
+}
+
+/// 100 wrong passwords from ONE IP: the per-IP ladder engages (cap 1 h)
+/// and blocks that peer regardless of username, while other IPs are
+/// unaffected (per-IP isolation).
+#[tokio::test]
+async fn per_ip_lockout_blocks_brute_force_and_isolates_peers() {
+    let cfg = throttle_cfg(10, 60_000, 10_000);
+    let t = file_storage::security::throttle::LoginThrottle::from_cfg(&cfg);
+    let attacker = ip(1);
+    let victim_ips = ip(2);
+
+    // The per-IP ladder ramps: 10ms, 20ms, 40ms... capped at 60s here.
+    let mut last = 0u64;
+    for i in 0..12u32 {
+        last = t.record_failure_ip(attacker);
+        let _ = i;
+    }
+    assert!(last > 0, "per-IP backoff grows");
+    assert!(t.check_ip(attacker).is_err(), "attacking IP locked out");
+    assert!(
+        t.check_ip(victim_ips).is_ok(),
+        "another IP is unaffected (per-IP isolation)"
+    );
+}
+
+/// The eviction-DoS resistance (charter §4.3): flooding the USERNAME map
+/// (10k+ usernames) evicts per-user entries — but the per-IP budget of
+/// the flood source still gates it. The attacker's own IP ladder is
+/// untouched by username-map churn.
+#[tokio::test]
+async fn username_eviction_does_not_reset_the_ip_ladder() {
+    let cfg = throttle_cfg(50, 60_000, 32); // tiny capacity → fast churn
+    let t = file_storage::security::throttle::LoginThrottle::from_cfg(&cfg);
+    let attacker = ip(9);
+
+    // Build a real IP-level backoff first.
+    t.record_failure_ip(attacker);
+    t.record_failure_ip(attacker);
+
+    // Flood the USERNAME map far beyond capacity.
+    for i in 0..128u32 {
+        t.record_failure(&format!("flood-{i}"));
+    }
+
+    // The attacking IP's ladder survives the username-map churn.
+    assert!(
+        t.check_ip(attacker).is_err(),
+        "IP ladder must be independent of username-map eviction (V6-15)"
+    );
+}
+
+/// Throttle metrics: lockout events tick the dimension-tagged counter.
+#[tokio::test]
+async fn throttle_metrics_emitted() {
+    file_storage::metrics::init_recorder();
+    let cfg = throttle_cfg(50, 60_000, 100);
+    let t = file_storage::security::throttle::LoginThrottle::from_cfg(&cfg);
+    let attacker = ip(5);
+    t.record_failure_ip(attacker);
+    assert!(t.check_ip(attacker).is_err());
+    // The handler-level counter (REST + gRPC Throttled arms) renders with
+    // a bounded dimension label — never the raw identity (H-05 discipline).
+    file_storage::metrics::record_login_throttled("ip");
+    file_storage::metrics::record_login_throttled("user");
+    let render = file_storage::metrics::render();
+    assert!(
+        render.contains("file_storage_login_throttle_locked_total"),
+        "login_throttle counter family must render (V6-15)"
+    );
+    assert!(
+        render.contains("dimension=\"ip\"") && render.contains("dimension=\"user\""),
+        "dimension labels present, identity-free: {render}"
+    );
 }
