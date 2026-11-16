@@ -1,19 +1,14 @@
 version: "3.9"
 
-# C-01: secrets come from the compose `secrets:` facility (git-ignored);
-# containers run as nonroot; ports bind to loopback — an edge proxy
-# terminates TLS. `cp secrets/file-storage.yaml.example secrets/file-storage.yaml`
-# and fill in operator-generated secrets before `docker compose up`.
-
 services:
   primary:
     build: .
     image: file-storage:1.0.0
     container_name: fs-primary
-    user: "65532:65532"          # nonroot; NEVER "0:0"
+    user: "65532:65532"
     ports:
-      - "127.0.0.1:8080:8080"   # REST (loopback by default)
-      - "127.0.0.1:9090:9090"   # gRPC  (loopback by default)
+      - "127.0.0.1:8080:8080"   # REST
+      - "127.0.0.1:9090:9090"   # gRPC
     environment:
       FS_SERVER__PORT: "8080"
       FS_SERVER__GRPC_PORT: "9090"
@@ -30,10 +25,6 @@ services:
       - file-storage.yaml
     volumes:
       - fs_primary:/var/lib/file-storage/data
-    # V6-OPS-01: bounded resources, sized logs. NO compose healthcheck:
-    # the distroless runtime has no shell/wget to run one. Probes belong
-    # to the orchestrator (k8s liveness/readiness hit /health, /ready);
-    # compose `depends_on` handles startup order here.
     mem_limit: 2g
     cpus: 2.0
     logging:
@@ -68,7 +59,6 @@ services:
       - file-storage.yaml
     volumes:
       - fs_replica:/var/lib/file-storage/data
-    # V6-OPS-01 (replica mirrors primary; no healthcheck — see primary).
     mem_limit: 2g
     cpus: 2.0
     logging:
@@ -85,12 +75,11 @@ services:
       - primary
       - replica
     ports:
-      - "127.0.0.1:9099:9090"   # host 9090 belongs to the gRPC listeners
+      - "127.0.0.1:9099:9090"
     volumes:
       - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     restart: unless-stopped
 
-  # One-shot service discovery check (run: docker compose run --rm grpcurl).
   grpcurl:
     image: fullstorydev/grpcurl:v1.9.1
     profiles: ["grpc-test"]
