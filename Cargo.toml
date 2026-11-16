@@ -55,7 +55,6 @@ harness = false
 axum = { version = "0.7", features = ["multipart", "macros"] }
 tokio = { version = "1.40", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "request-id", "catch-panic"] }
-hyper = "1"
 bytes = "1"
 futures = "0.3"
 async-stream = "0.3"
@@ -82,7 +81,6 @@ argon2 = "0.5"
 aes-gcm = "0.10"
 rand = "0.8"
 dashmap = "5"
-base64 = "0.22"
 
 # Rate limiting
 tower_governor = "0.4"
@@ -90,9 +88,11 @@ governor = "0.6"
 
 # Observability
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.23"
 metrics-exporter-prometheus = "0.15"
+# NOTE (hygiene audit): `tracing-subscriber` was removed — zero references
+# in src/ (verified by grep + build). If log output is ever wired up, the
+# subscriber init belongs beside metrics::init_recorder.
 
 # Replication client (cluster-internal plain HTTP)
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart"] }
@@ -102,7 +102,6 @@ tonic = { version = "0.12", features = ["tls", "tls-roots", "gzip"] }
 prost = "0.13"
 prost-types = "0.13"
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
-tokio-util = { version = "0.7", features = ["io"] }
 http = "1"
 http-body = "1"
 tower = { version = "0.4", features = ["util"] }
@@ -131,13 +130,8 @@ tonic-build = { version = "0.12", features = ["prost"] }
 protoc-bin-vendored = "3"
 
 [dev-dependencies]
+# Only crates NOT already in [dependencies] (dev targets inherit those).
 criterion = "0.5"
-tempfile = "3"
-serde_json = "1"
-blake3 = "1.5"
-futures = "0.3"
-rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart"] }
 rcgen = "0.13"
 proptest = "1.8.0"
 

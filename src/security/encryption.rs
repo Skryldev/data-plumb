@@ -126,8 +126,14 @@ impl Encryptor {
 }
 
 /// Verifies the on-disk key file permissions are owner-only (unix).
+///
+/// Unix-only by cfg: on other platforms the function does not exist, so a
+/// caller that needs the check fails at compile time instead of silently
+/// getting "ok". `Path` is fully qualified so the unix-only reference does
+/// not become an unused import on non-unix targets (the crate must build
+/// on both — Docker/Linux compiles this body, Windows does not).
 #[cfg(unix)]
-pub fn key_file_permissions_ok(path: &Path) -> bool {
+pub fn key_file_permissions_ok(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(path) {
         Ok(m) => m.permissions().mode() & 0o077 == 0,
