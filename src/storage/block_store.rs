@@ -440,6 +440,11 @@ mod tests {
 
 #[cfg(all(test, unix))]
 mod fsync_discriminator_tests {
+    // CF-1 (PG-1R2FIX): `use super::*` was MISSING - the module referenced
+    // BlockStore without importing it. Invisible on Windows (the module is
+    // cfg'd out) but a hard E0433 on Linux CI. Reproduced locally via the
+    // cfg-relaxation probe; fixed; gate restored.
+    use super::*;
     /// V8 C-3 (V8-REG-01): the dir-fsync durability sequence is now
     /// DISCRIMINATED. If anyone removes the fsync call from fsync_dir /
     /// fsync_dir_blocking, this counter freezes and the test goes red —
