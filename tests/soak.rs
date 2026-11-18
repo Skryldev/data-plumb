@@ -36,6 +36,96 @@ fn dir_usage(dir: &std::path::Path) -> u64 {
     total
 }
 
+/// I-8 (wal.md §8): WAL churn + kill cadence. Continuous commit bursts
+/// against a real WAL + in-process "kills" (drop the WAL, reopen: recovery
+/// replays committed txns past the watermark). Invariants: zero recovery
+/// failures; watermark strictly monotonic across kills; segment count
+/// bounded; no unbounded tail growth. Cross-platform (failpoint-style
+/// in-process kills, no external kill dependency).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "soak — nightly job (30 s slice) or operator dispatch (SOAK_SECONDS)"]
+async fn soak_wal_churn_and_kill_cadence() {
+    use file_storage::storage::wal::{Op, RecoverSink, Wal};
+
+    let seconds: u64 = std::env::var("SOAK_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+    let wal_dir = dir.path().join("wal");
+    std::fs::create_dir_all(&wal_dir).unwrap();
+
+    // Real recovery sink: an IndexDb on the same dir (watermark persists in
+    // redb meta across "kills" — that IS the invariant being exercised).
+    let db_path = dir.path().join("index.redb");
+    let sink = Arc::new(file_storage::storage::index_db::IndexDb::open(&db_path).unwrap());
+
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut last_watermark: u64 = 0;
+    let mut kills = 0u64;
+    let mut committed_total = 0u64;
+
+    while Instant::now() < deadline {
+        // One WAL "generation": commit bursts, then a kill (drop + reopen).
+        let wal = Wal::open(&wal_dir, sink.clone(), Duration::from_millis(2), 64 * 1024).unwrap();
+        let burst_deadline = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < burst_deadline {
+            wal.commit_txn(vec![
+                Op::PutManifest {
+                    key: format!("k-{}", uuid::Uuid::now_v7()).into_bytes(),
+                    record: vec![0xAB; 128],
+                },
+                Op::QuotaDelta {
+                    tenant: *uuid::Uuid::now_v7().as_bytes(),
+                    bytes: 128,
+                    files: 1,
+                },
+            ])
+            .unwrap();
+            committed_total += 1;
+        }
+        wal.flush_pending().unwrap();
+        drop(wal); // the kill: recovery happens on the next open
+        kills += 1;
+
+        let w = Wal::open(&wal_dir, sink.clone(), Duration::from_millis(2), 64 * 1024).unwrap();
+        let wm = sink.watermark();
+        assert!(
+            wm >= last_watermark,
+            "watermark MUST be monotonic across kills: {wm} < {last_watermark}"
+        );
+        last_watermark = wm;
+        w.flush_pending().unwrap();
+        drop(w);
+    }
+
+    // Segment count bounded (rotation per wal.md §2; the churn produced
+    // 64KiB batches — far below the 64MiB cap, so count stays small).
+    let mut seg_count = 0u64;
+    for e in std::fs::read_dir(&wal_dir).unwrap().flatten() {
+        if e.file_name().to_string_lossy().starts_with("wal-") {
+            seg_count += 1;
+        }
+    }
+    assert!(
+        seg_count < 100,
+        "WAL segments must be bounded: {seg_count} after {kills} kills"
+    );
+    tracing::info!(
+        kills,
+        committed_total,
+        last_watermark,
+        seg_count,
+        seconds,
+        "wal-churn soak slice complete"
+    );
+    assert!(kills >= 2, "the slice must exercise at least 2 kill cycles");
+    assert_eq!(
+        last_watermark, committed_total,
+        "every committed txn survives the kill cadence exactly once"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "soak — nightly job (60 s slice) or operator dispatch (SOAK_SECONDS)"]
 async fn soak_upload_delete_gc_reconcile_loop() {

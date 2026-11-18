@@ -105,6 +105,22 @@ impl Encryptor {
     }
 
     /// Storage key for a plaintext chunk hash under a tenant:
+    /// `BLAKE3(tenant_id || plain_hash)` — tenant-scoped addressing
+    /// (M-16: this is now the DEFAULT for BOTH encrypted and plaintext
+    /// chunks; the cross-tenant existence oracle is closed by
+    /// construction). Legacy `global` scope stores the raw hash.
+    pub fn scoped_key(
+        scope: crate::config::DedupScope,
+        tenant: &Uuid,
+        plain_hash: &[u8; 32],
+    ) -> [u8; 32] {
+        match scope {
+            crate::config::DedupScope::Tenant => Self::storage_key(tenant, plain_hash),
+            crate::config::DedupScope::Global => *plain_hash,
+        }
+    }
+
+    /// Storage key for a plaintext chunk hash under a tenant:
     /// `BLAKE3(tenant_id || plain_hash)` — keeps encrypted dedup scoped to
     /// the tenant (random nonces make ciphertext-addressing impossible).
     pub fn storage_key(tenant: &Uuid, plain_hash: &[u8; 32]) -> [u8; 32] {
@@ -251,5 +267,37 @@ mod tests {
         let tenant = Uuid::now_v7();
         assert!(enc.decrypt(&tenant, b"short").is_err());
         assert!(enc.decrypt(&tenant, &[0u8; 20]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod m16_tests {
+    use super::*;
+    use crate::config::DedupScope;
+
+    /// Contract gate (PG-1 §2.4): same bytes, two tenants, tenant scope →
+    /// two DISTINCT block keys; the plaintext cross-tenant existence
+    /// oracle (V3 M-16) is closed by construction. Also proves the legacy
+    /// `global` opt-in still collides (documented behavior).
+    #[test]
+    fn cross_tenant_dedup_never_shares_chunks() {
+        let t1 = Uuid::now_v7();
+        let t2 = Uuid::now_v7();
+        let h = [7u8; 32];
+        assert_ne!(
+            Encryptor::scoped_key(DedupScope::Tenant, &t1, &h),
+            Encryptor::scoped_key(DedupScope::Tenant, &t2, &h),
+            "tenant scope: same bytes, different tenants -> different block keys"
+        );
+        assert_ne!(
+            Encryptor::scoped_key(DedupScope::Tenant, &t1, &h),
+            h,
+            "tenant scope must not equal the raw hash (global would)"
+        );
+        assert_eq!(
+            Encryptor::scoped_key(DedupScope::Global, &t1, &h),
+            h,
+            "global scope (documented opt-in) keeps raw-hash addressing"
+        );
     }
 }

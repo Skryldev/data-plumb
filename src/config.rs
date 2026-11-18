@@ -49,6 +49,12 @@ pub struct AppConfig {
     pub limits: LimitsConfig,
     /// H-05/M-17: exposure policy for the ops endpoints.
     pub metrics: MetricsConfig,
+    /// M-16/V9-PG1: dedup chunk-key scoping (storage-format-v2.md §7).
+    pub dedup: DedupConfig,
+    /// WAL tuning (wal.md §6.2, PG-1R I-9a).
+    pub wal: WalConfig,
+    /// v1→v2 metadata migration (storage-format-v2.md §6; PG-1R I-9a).
+    pub migration: MigrationConfig,
     /// H-03: upload content validation policy.
     pub validation: ValidationConfig,
     pub logging: LoggingConfig,
@@ -344,6 +350,11 @@ pub struct LimitsConfig {
     /// H-01: global cap on concurrent upload pipeline tasks.
     #[serde(default = "default_max_concurrent_uploads")]
     pub max_concurrent_uploads: usize,
+    /// I-2 (storage-format-v2.md §5): per-tenant committed-bytes quota.
+    /// None = unlimited (default). Enforced at the commit txn (re-check),
+    /// not just admission.
+    #[serde(default)]
+    pub max_quota_bytes: Option<u64>,
     /// M-09: body ceiling for the `/internal` replication endpoints
     /// (file bundles carry the FULL manifest + chunk set, which can exceed
     /// the public upload body cap). Defaults to max_file_size + 64 MiB of
@@ -400,6 +411,54 @@ pub enum ValidationMode {
 pub struct ValidationConfig {
     #[serde(default)]
     pub mode: ValidationMode,
+}
+
+/// M-16: dedup chunk addressing scope. `tenant` (DEFAULT) derives
+/// `BLAKE3(tenant_id ‖ plain_hash)` — the same bytes in two tenants never
+/// share a chunk, closing the cross-tenant content-existence oracle.
+/// `global` is a legacy opt-in for trusted single-tenant deployments
+/// (WARN at boot; the raw content hash is the key).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DedupScope {
+    #[default]
+    Tenant,
+    Global,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DedupConfig {
+    #[serde(default)]
+    pub scope: DedupScope,
+}
+
+/// WAL tuning (wal.md §6.2). All keys read at boot into the WAL builder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WalConfig {
+    /// Group-commit flush delay (ms): the batch window before fsync.
+    pub group_commit_delay_ms: u64,
+    /// Group-commit flush threshold (bytes): flush early when the buffered
+    /// batch exceeds this.
+    pub group_commit_max_bytes: usize,
+}
+impl Default for WalConfig {
+    fn default() -> Self {
+        Self {
+            group_commit_delay_ms: 5,
+            group_commit_max_bytes: 256 * 1024,
+        }
+    }
+}
+
+/// Migration policy (storage-format-v2.md §2/§6). Default refuses a v1 dir
+/// at boot with an actionable error; `auto=true` migrates inline on open.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct MigrationConfig {
+    /// Default false: a v1 dir refuses boot with the actionable xtask
+    /// error; the operator chooses the migration moment.
+    pub auto: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -552,9 +611,13 @@ impl AppConfig {
                 max_body: 1024 * 1024 * 1024,
                 max_in_flight_bytes: 512 * 1024 * 1024,
                 max_concurrent_uploads: 32,
+                max_quota_bytes: None,
                 internal_body: 2 * 1024 * 1024 * 1024,
             },
             metrics: MetricsConfig::default(),
+            dedup: DedupConfig::default(),
+            wal: WalConfig::default(),
+            migration: MigrationConfig::default(),
             validation: ValidationConfig::default(),
             logging: LoggingConfig {
                 format: "pretty".into(),
@@ -685,6 +748,19 @@ impl AppConfig {
             errs.push("server.grpc_tls requires cert_path and key_path".to_string());
         }
 
+        // V8 C-5 (V8-NEW-01): the per-IP lockout cap must outlast the
+        // per-username cap — otherwise an attacker waits out the IP window
+        // while a victim's username entry TTLs, defeating the layering.
+        if self.auth.login_throttle.enabled
+            && self.auth.login_throttle.ip_lockout_cap_ms < self.auth.login_throttle.lockout_cap_ms
+        {
+            errs.push(format!(
+                "auth.login_throttle.ip_lockout_cap_ms ({}) must be >= lockout_cap_ms ({}) — the per-IP window must outlast the per-username window",
+                self.auth.login_throttle.ip_lockout_cap_ms,
+                self.auth.login_throttle.lockout_cap_ms
+            ));
+        }
+
         if errs.is_empty() {
             Ok(())
         } else {
@@ -812,6 +888,25 @@ mod tests {
         cfg.auth.users[0].password = None;
         cfg.auth.users[0].password_hash = None;
         assert!(cfg.validate().is_err());
+    }
+
+    // V8 C-5 (V8-NEW-01): the throttle TTL ordering is boot-validated.
+    #[test]
+    fn c05_rejects_ip_cap_below_username_cap() {
+        let mut cfg = AppConfig::for_tests();
+        cfg.auth.login_throttle.ip_lockout_cap_ms = 60_000; // 1 min
+        cfg.auth.login_throttle.lockout_cap_ms = 900_000; // 15 min
+        let err = cfg
+            .validate_for(SecurityProfile::Release)
+            .expect_err("ip cap below username cap must refuse boot");
+        assert!(
+            err.to_string().contains("ip_lockout_cap_ms"),
+            "error names the offending key: {err}"
+        );
+        // The documented invariant passes (Debug profile: the test config
+        // uses plaintext passwords, which only Release rejects — C-01).
+        cfg.auth.login_throttle.ip_lockout_cap_ms = 3_600_000;
+        cfg.validate_for(SecurityProfile::Debug).unwrap();
     }
 
     #[test]

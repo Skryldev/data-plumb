@@ -32,8 +32,12 @@ jobs:
           # Deliberate violation: a known shipped literal, padded to pass the
           # length floor so ONLY the literal rule catches it.
           sed -i 's|jwt_secret: "PASTE_openssl_rand_hex_32_HERE"|jwt_secret: "change-me-in-production-0123456789abcdef-000000"|' /tmp/broken.yaml
-          sed -i 's|jwt_secret: "PASTE_openssl_rand_hex_32_HERE"|x|' /tmp/broken.yaml || true
           sed -i 's|api_key: "PASTE_openssl_rand_hex_24_HERE"|api_key: "internal-dev-api-key-change-me-000000"|' /tmp/broken.yaml
+          # V8 C-8 hard assertion (V8-INT-02): if the placeholder drifted,
+          # the sed silently no-ops and the fixture is VALID - the gate
+          # would pass for the wrong reason. Fail loudly instead.
+          grep -q 'change-me-in-production-0123456789abcdef-000000' /tmp/broken.yaml             || { echo "FIXTURE BROKEN: jwt sed did not apply - placeholder drifted"; exit 1; }
+          grep -q 'internal-dev-api-key-change-me-000000' /tmp/broken.yaml             || { echo "FIXTURE BROKEN: api_key sed did not apply"; exit 1; }
           grep -E 'jwt_secret|api_key' /tmp/broken.yaml
       - name: broken config MUST refuse to boot (gate inversion)
         run: |

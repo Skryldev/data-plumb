@@ -108,6 +108,14 @@ jobs:
           grep -qiE 'invalid configuration|jwt_secret|api_key|argon2|password' /tmp/boot.txt             || { echo "refusal must name its violations"; exit 1; }
       - name: secreted config MUST boot and serve /health
         run: |
+          # F4: the example config ships /var/lib paths (unwritable on
+          # the runner); override the four state dirs - the same
+          # mechanism tests/regression_c01_boot.rs uses.
+          export FS_STORAGE__ROOT=/tmp/fsdata/blocks
+          export FS_STORAGE__TEMP_DIR=/tmp/fsdata/tmp
+          export FS_DATABASE__PATH=/tmp/fsdata/index.redb
+          export FS_ENCRYPTION__KEYS_DIR=/tmp/fsdata/keys
+          mkdir -p /tmp/fsdata
           cp secrets/file-storage.yaml.example /tmp/secretful.yaml
           sed -i "s/PASTE_openssl_rand_hex_32_HERE/$(openssl rand -hex 32)/" /tmp/secretful.yaml
           sed -i "s/PASTE_openssl_rand_hex_24_HERE/$(openssl rand -hex 24)/" /tmp/secretful.yaml
@@ -168,6 +176,12 @@ jobs:
       - run: cargo build --release --bin file-storage
       - name: boot secreted stack
         run: |
+          # F4: writable state dirs on the runner (see c01-boot-gate).
+          export FS_STORAGE__ROOT=/tmp/fsdash/blocks
+          export FS_STORAGE__TEMP_DIR=/tmp/fsdash/tmp
+          export FS_DATABASE__PATH=/tmp/fsdash/index.redb
+          export FS_ENCRYPTION__KEYS_DIR=/tmp/fsdash/keys
+          mkdir -p /tmp/fsdash
           cp secrets/file-storage.yaml.example /tmp/secretful.yaml
           sed -i "s/PASTE_openssl_rand_hex_32_HERE/$(openssl rand -hex 32)/" /tmp/secretful.yaml
           sed -i "s/PASTE_openssl_rand_hex_24_HERE/$(openssl rand -hex 24)/" /tmp/secretful.yaml
@@ -186,11 +200,20 @@ jobs:
     needs: [clippy-test-linux]
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t file-storage:ci .
+      # F5: BUILD the local tree with the exact tag docker-compose.yml
+      # references. Without this, compose pulls the STALE published
+      # image (predates the remediation waves) and the PoC runs old
+      # code - the 000/6-ATTACKS CI failure.
+      - name: build local image with the compose tag
+        run: |
+          COMPOSE_TAG=$(grep -m1 'image:' docker-compose.yml | awk '{print $2}')
+          echo "building local image tagged: $COMPOSE_TAG"
+          docker build -t "$COMPOSE_TAG" .
       - name: C-01 gate — secretless boot must fail
         run: |
           set +e
-          docker run --rm file-storage:ci --config /run/secrets/file-storage.yaml
+          COMPOSE_TAG=$(grep -m1 'image:' docker-compose.yml | awk '{print $2}')
+          docker run --rm "$COMPOSE_TAG" --config /run/secrets/file-storage.yaml
           code=$?
           set -e
           test "$code" -ne 0 || { echo "C-01 VIOLATION: booted without secrets"; exit 1; }
@@ -199,9 +222,12 @@ jobs:
           cp secrets/file-storage.yaml.example secrets/file-storage.yaml
           sed -i "s/PASTE_openssl_rand_hex_32_HERE/$(openssl rand -hex 32)/" secrets/file-storage.yaml
           sed -i "s/PASTE_openssl_rand_hex_24_HERE/$(openssl rand -hex 24)/" secrets/file-storage.yaml
-          HASH=$(docker run --rm --entrypoint /usr/local/bin/file-storage file-storage:ci hash-password --password bootstrap-admin-pw-1)
+          COMPOSE_TAG=$(grep -m1 'image:' docker-compose.yml | awk '{print $2}')
+          HASH=$(docker run --rm --entrypoint /usr/local/bin/file-storage "$COMPOSE_TAG" hash-password --password bootstrap-admin-pw-1)
           sed -i "s|PASTE_FILE_STORAGE_HASH_PASSWORD_OUTPUT_HERE|$HASH|" secrets/file-storage.yaml
-          docker compose up -d --wait
+          # The local tag built above IS the image compose uses (no pull).
+          docker compose up -d --wait --pull never
+          docker compose ps
           bash poc_expect_fail.sh
 
   # V6-06 REPAIR: the old nightly job was gated on `schedule` that the

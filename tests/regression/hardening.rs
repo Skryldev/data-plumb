@@ -5,12 +5,21 @@ use file_storage::state::AppState;
 use std::sync::Arc;
 
 struct Fixture {
+    /// Holds the process-global metrics serializer for the test's lifetime
+    /// (see spawn(); dropped after the test finishes).
+    _metrics: tokio::sync::MutexGuard<'static, ()>,
     base: String,
     _state: AppState,
     _dir: tempfile::TempDir,
 }
 
 async fn spawn(exposure: file_storage::config::MetricsExposure) -> Fixture {
+    // EVERY test in this binary hits the process-global Prometheus recorder
+    // (each HTTP request adds series). Holding the serializer for the whole
+    // fixture lifetime keeps the label-sensitive h05 gates deterministic —
+    // the h05 flakes of 2026-11-18 CI were cross-test recorder races, not
+    // product regressions.
+    let _metrics_guard = MetricsGuard::guard().await;
     file_storage::metrics::init_recorder();
     let dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
     let mut cfg = AppConfig::for_tests();
@@ -32,6 +41,7 @@ async fn spawn(exposure: file_storage::config::MetricsExposure) -> Fixture {
         .unwrap();
     });
     Fixture {
+        _metrics: _metrics_guard,
         base: format!("http://{addr}"),
         _state: state,
         _dir: dir,
@@ -40,6 +50,13 @@ async fn spawn(exposure: file_storage::config::MetricsExposure) -> Fixture {
 
 /// Process-global serializer for the metrics gates (see h05 tests).
 static METRICS_SERIALIZER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct MetricsGuard;
+impl MetricsGuard {
+    async fn guard() -> tokio::sync::MutexGuard<'static, ()> {
+        METRICS_SERIALIZER.lock().await
+    }
+}
 
 async fn admin_token(base: &str) -> String {
     let http = reqwest::Client::new();
@@ -301,7 +318,6 @@ async fn h05_metrics_cardinality_stable() {
     // Serialize against the other label-sensitive gates in this binary:
     // the Prometheus recorder is process-global, so a concurrent test's
     // requests would otherwise be counted as "growth".
-    let _guard = METRICS_SERIALIZER.lock().await;
     let fx = spawn(file_storage::config::MetricsExposure::Loopback).await;
     let http = reqwest::Client::new();
     let series = |body: &str| {
@@ -343,7 +359,6 @@ async fn h05_metrics_cardinality_stable() {
 
 #[tokio::test]
 async fn h05_metrics_matched_route_labels() {
-    let _guard = METRICS_SERIALIZER.lock().await;
     let fx = spawn(file_storage::config::MetricsExposure::Loopback).await;
     let token = admin_token(&fx.base).await;
     let http = reqwest::Client::new();
@@ -376,7 +391,6 @@ async fn h05_metrics_matched_route_labels() {
 
 #[tokio::test]
 async fn h05_metrics_loopback_only_by_default() {
-    let _guard = METRICS_SERIALIZER.lock().await;
     // Default exposure is Loopback. From 127.0.0.1 (our harness peer) the
     // endpoint serves; a spoofed non-loopback scenario is covered by the
     // guard unit test below. Here we assert the default is loopback and the
@@ -394,7 +408,6 @@ async fn h05_metrics_loopback_only_by_default() {
 
 #[tokio::test]
 async fn h05_metrics_api_key_mode_rejects_wrong_key() {
-    let _guard = METRICS_SERIALIZER.lock().await;
     let fx = spawn(file_storage::config::MetricsExposure::ApiKey).await;
     let http = reqwest::Client::new();
     let status = http
@@ -646,6 +659,7 @@ async fn h03_upload_mime_mismatch_grpc_415() {
 // ---------------------------------------------------------------------------
 
 async fn spawn_with_budget(budget: u64) -> Fixture {
+    let _metrics_guard = MetricsGuard::guard().await;
     file_storage::metrics::init_recorder();
     let dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
     let mut cfg = AppConfig::for_tests();
@@ -666,6 +680,7 @@ async fn spawn_with_budget(budget: u64) -> Fixture {
         .unwrap();
     });
     Fixture {
+        _metrics: _metrics_guard,
         base: format!("http://{addr}"),
         _state: state,
         _dir: dir,

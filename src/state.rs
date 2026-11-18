@@ -44,6 +44,9 @@ pub struct Inner {
     pub audit: Arc<AuditLog>,
     pub replicator: Arc<Replicator>,
     pub gc: Arc<GarbageCollector>,
+    /// WAL instance (builder wired at boot; commit-path integration in the
+    /// next increment). `None` when the WAL is disabled.
+    pub wal: Option<Arc<crate::storage::wal::Wal>>,
     pub started_at: Instant,
 }
 
@@ -66,7 +69,13 @@ pub async fn build_state(cfg: Arc<AppConfig>) -> Result<AppState, StorageError> 
         std::fs::create_dir_all(parent).map_err(StorageError::from)?;
     }
 
-    let index = Arc::new(IndexDb::open(&cfg.database.path)?);
+    // Schema gate (storage-format-v2.md §2): migration.auto=false (default)
+    // refuses a v1 dir with the actionable xtask error; auto=true migrates
+    // inline on open.
+    let index = Arc::new(IndexDb::open_with_policy(
+        &cfg.database.path,
+        cfg.migration.auto,
+    )?);
     let blocks = Arc::new(BlockStore::new(&cfg.storage.root, cfg.storage.shard_depth));
     blocks.verify_writable().await?;
 
@@ -139,6 +148,25 @@ pub async fn build_state(cfg: Arc<AppConfig>) -> Result<AppState, StorageError> 
         cfg.rate_limit.burst,
     );
 
+    // WAL builder (wal.md §6.2): constructed from config at boot even
+    // though the pipeline commit-path integration lands in the next
+    // increment - the keys are read and their effect observable here.
+    let wal = crate::storage::wal::Wal::open(
+        cfg.database
+            .path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("wal"),
+        index.clone(),
+        std::time::Duration::from_millis(cfg.wal.group_commit_delay_ms.max(1)),
+        cfg.wal.group_commit_max_bytes.max(64),
+    )?;
+    tracing::info!(
+        group_commit_delay_ms = cfg.wal.group_commit_delay_ms,
+        group_commit_max_bytes = cfg.wal.group_commit_max_bytes,
+        "WAL initialized"
+    );
+
     let gc = Arc::new(GarbageCollector::new(
         index.clone(),
         blocks.clone(),
@@ -164,6 +192,7 @@ pub async fn build_state(cfg: Arc<AppConfig>) -> Result<AppState, StorageError> 
     // longer grow disk monotonically. Fresh files are left alone.
     let boot_swept = boot_sweep_tmp(
         &cfg,
+        &index,
         std::time::Duration::from_secs(cfg.retention.orphan_min_age_secs),
     )
     .await?;
@@ -218,6 +247,7 @@ pub async fn build_state(cfg: Arc<AppConfig>) -> Result<AppState, StorageError> 
         audit,
         replicator,
         gc,
+        wal: Some(wal),
         started_at: Instant::now(),
     })))
 }
@@ -232,6 +262,7 @@ pub async fn build_state(cfg: Arc<AppConfig>) -> Result<AppState, StorageError> 
 /// temp/quarantine dirs; a missing dir is tolerated (fresh deployments).
 async fn boot_sweep_tmp(
     cfg: &AppConfig,
+    index: &crate::storage::index_db::IndexDb,
     min_age: std::time::Duration,
 ) -> Result<u64, StorageError> {
     let cutoff = std::time::SystemTime::now()
@@ -248,14 +279,15 @@ async fn boot_sweep_tmp(
     // The count crosses the blocking-pool boundary via the JoinHandle —
     // u64 is Copy, so mutating a captured copy would silently drop the
     // count (this exact bug made the metric read 0).
+    let index2 = index.clone();
     let removed = tokio::task::spawn_blocking(move || {
         let mut n = 0u64;
-        sweep_dir_blocking(&root, cutoff, &mut n, depth, true);
+        sweep_dir_blocking(&root, cutoff, &mut n, depth, true, &index2);
         // Temp spool: flat dir, any stale file goes. NOTE: the quarantine
         // dir is deliberately NOT swept here — `Quarantine::sweep_expired`
         // owns it (with its own metric + retention policy) right after;
         // a second sweep here would race it for the count.
-        sweep_dir_blocking(&temp, cutoff, &mut n, 1, false);
+        sweep_dir_blocking(&temp, cutoff, &mut n, 1, false, &index2);
         n
     })
     .await
@@ -272,6 +304,7 @@ fn sweep_dir_blocking(
     removed: &mut u64,
     depth_remaining: usize,
     cas_mode: bool,
+    index_ref: &crate::storage::index_db::IndexDb,
 ) {
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -282,7 +315,14 @@ fn sweep_dir_blocking(
         let Ok(meta) = entry.metadata() else { continue };
         if meta.is_dir() {
             if depth_remaining > 1 {
-                sweep_dir_blocking(&path, cutoff, removed, depth_remaining - 1, cas_mode);
+                sweep_dir_blocking(
+                    &path,
+                    cutoff,
+                    removed,
+                    depth_remaining - 1,
+                    cas_mode,
+                    index_ref,
+                );
             }
             continue;
         }
@@ -305,7 +345,42 @@ fn sweep_dir_blocking(
             .map(|d| (d.as_millis() as i64) < cutoff)
             .unwrap_or(false);
         let stale = stale_by_age && (if cas_mode { stale_by_name } else { true });
-        if stale && std::fs::remove_file(&path).is_ok() {
+        if !stale {
+            continue;
+        }
+        // V8 C-4 (V8-REG-02 closure): a .gc-pending claim may hold the LAST
+        // local copy of a blob whose chunk row is LIVE (crash between the
+        // runtime re-check and restore). Never delete a pending blob
+        // blindly: consult the index and RESTORE to canonical when the row
+        // is live.
+        if name.ends_with("gc-pending") {
+            let hash_hex = name
+                .strip_suffix(".gc-pending")
+                .and_then(|s| s.split('.').next())
+                .map(|s| s.to_string());
+            if let Some(hex) = hash_hex {
+                if let Ok(bytes) = hex::decode(&hex) {
+                    if bytes.len() == 32 {
+                        let mut h = [0u8; 32];
+                        h.copy_from_slice(&bytes);
+                        if index_ref.chunk_is_referenced_sync(&h).unwrap_or(false) {
+                            // Resurrect: the pending claim lives in the same
+                            // shard dir as its canonical sibling.
+                            let canonical = dir.join(format!("{}.bin", hex));
+                            if std::fs::rename(&path, &canonical).is_ok() {
+                                tracing::warn!(
+                                    hash = %hex,
+                                    "boot sweep RESTORED a resurrected .gc-pending blob (V8-REG-02)"
+                                );
+                                *removed += 1; // the pending artifact is consumed
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        if std::fs::remove_file(&path).is_ok() {
             *removed += 1;
         }
     }
@@ -382,6 +457,90 @@ mod boot_sweep_tests {
             "this boot swept 3 stale files; metric shows {value}: {line}"
         );
         let _ = state; // keep the server alive for the assertion window
+    }
+
+    /// V8 C-4 (V8-REG-02 inversion): a `.gc-pending` claim whose chunk row
+    /// is LIVE (the crash-between-recheck-and-restore window) must be
+    /// RESTORED to canonical by the boot sweep, not deleted. The blob
+    /// bytes survive; the pending artifact is consumed. Without the C-4
+    /// re-check this test goes red (the pending file is destroyed).
+    #[tokio::test]
+    async fn boot_sweep_restores_resurrected_pending() {
+        let dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let mut cfg = AppConfig::for_tests();
+        cfg = cfg.with_data_root(dir.path());
+        cfg.retention.orphan_min_age_secs = 0;
+
+        // Build the store, then fabricate the crash window: a live chunk
+        // row + a `.gc-pending` claim holding the blob bytes + NO canonical
+        // blob (the runtime claim renamed it away before the crash).
+        let state = build_state(Arc::new(cfg.clone())).await.unwrap();
+        let data = vec![0xEEu8; 512];
+        let hash = crate::core::hasher::hash_bytes(&data);
+        state.0.blocks.write(&hash, &data).await.unwrap();
+        state
+            .0
+            .index
+            .register_chunks_at_commit(
+                vec![crate::storage::index_db::ChunkRegistration {
+                    hash,
+                    size_stored: data.len() as u64,
+                    on_disk_path: state.0.blocks.relative_path(&hash),
+                }],
+                {
+                    let b = state.0.blocks.clone();
+                    move |p: &str| b.path_exists(p)
+                },
+            )
+            .await
+            .unwrap();
+        let (_, canonical) = state.0.blocks.shard_path(&hash);
+        let pending =
+            canonical.with_file_name(format!("{}.deadbeef.gc-pending", hex::encode(hash)));
+        std::fs::rename(&canonical, &pending).unwrap(); // the runtime claim
+
+        // Boot #2: the sweep must RESTORE the resurrected pending blob.
+        // Drive boot_sweep_tmp directly (it is the same function
+        // build_state runs; a second build_state cannot re-lock redb while
+        // the first state's background tasks hold the handle).
+        boot_sweep_tmp(&cfg, &state.0.index, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(
+            canonical.exists(),
+            "V8 C-4: the resurrected pending blob must be restored to canonical"
+        );
+        assert!(!pending.exists(), "the pending artifact must be consumed");
+        assert!(
+            state.0.index.chunk_is_referenced(&hash).await.unwrap(),
+            "the chunk row stays live"
+        );
+        let read_back = state.0.blocks.read(&hash).await.unwrap();
+        assert_eq!(
+            read_back.as_ref(),
+            data.as_slice(),
+            "bytes survive byte-perfect"
+        );
+    }
+
+    /// I-9a wiring evidence: the WAL config keys are read at boot with
+    /// observable effect (flip the key -> the builder sees the flipped
+    /// value; the boot log names both).
+    #[tokio::test]
+    async fn wal_config_keys_read_at_boot() {
+        let dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let mut cfg = AppConfig::for_tests();
+        cfg = cfg.with_data_root(dir.path());
+        cfg.wal.group_commit_delay_ms = 42;
+        cfg.wal.group_commit_max_bytes = 777_777;
+        let state = build_state(Arc::new(cfg)).await.unwrap();
+        let wal = state
+            .0
+            .wal
+            .as_ref()
+            .expect("WAL must be constructed at boot");
+        assert_eq!(wal.delay_for_test(), std::time::Duration::from_millis(42));
+        assert_eq!(wal.max_batch_bytes_for_test(), 777_777);
     }
 
     /// CAS safety: a LIVE blob (canonical <hex>.bin in a shard dir) must

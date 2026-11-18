@@ -168,8 +168,21 @@ pub async fn run() -> anyhow::Result<()> {
         }
     };
 
+    // boot.md mirror order: stop accepting (join! above) -> drain in-flight
+    // (leases released on drop) -> replication queue drained -> WAL
+    // group-commit flush -> exit. redb closes when the handles drop.
     tracing::info!("shutting down: flushing replication queue");
     state.0.replicator.shutdown().await;
+    if let Some(wal) = &state.0.wal {
+        tracing::info!("shutting down: flushing WAL group-commit buffer");
+        if let Err(e) = wal.flush_pending() {
+            // Fail-stop per the durability policy: the state is recoverable
+            // (records may or may not be durable — recovery sorts it out),
+            // but we exit non-zero loudly.
+            tracing::error!(error = %e, "WAL final flush failed — exiting non-zero");
+            return Err(anyhow::anyhow!("WAL final flush failed: {e}"));
+        }
+    }
     tracing::info!("bye");
     outcome
 }

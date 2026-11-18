@@ -4,9 +4,9 @@ package file_storage.v1;
 
 import "google/protobuf/timestamp.proto";
 
-option go_package = "github.com/your-org/file-storage/api/v1;v1";
-option java_package = "com.yourorg.filestorage.v1";
-option csharp_namespace = "YourOrg.FileStorage.V1";
+option go_package = "github.com/cie-aa/data-plumb/proto/file_storage/v1;file_storagev1";
+option java_package = "com.cieaa.filestorage.v1";
+option csharp_namespace = "CieAa.FileStorage.V1";
 
 // Reference to one chunk inside a file. `hash` is the block-store key —
 // the plaintext BLAKE3, or BLAKE3(tenant_id || plain_hash) when the blob

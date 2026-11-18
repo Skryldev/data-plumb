@@ -98,12 +98,12 @@ async fn race_gc_upload_x100() {
             .await
             .unwrap();
         rig.index
-            .register_chunk_verified(
-                ChunkRegistration {
+            .register_chunks_at_commit(
+                vec![ChunkRegistration {
                     hash: seed_hash,
                     size_stored: 4,
                     on_disk_path: rig.blocks.relative_path(&seed_hash),
-                },
+                }],
                 {
                     let b = rig.blocks.clone();
                     move |p: &str| b.path_exists(p)
@@ -126,12 +126,12 @@ async fn race_gc_upload_x100() {
             // the entire upload stream)
             tokio::time::sleep(Duration::from_micros((i % 37) as u64 * 100)).await;
             let out = up_index
-                .register_chunk_verified(
-                    ChunkRegistration {
+                .register_chunks_at_commit(
+                    vec![ChunkRegistration {
                         hash,
                         size_stored: up_data.len() as u64,
                         on_disk_path: up_path.clone(),
-                    },
+                    }],
                     {
                         let b = up_blocks.clone();
                         move |p: &str| b.path_exists(p)
@@ -141,15 +141,15 @@ async fn race_gc_upload_x100() {
                 .unwrap();
             // self-heal: rewrite + retry once on rejection
             let mut outcome = out;
-            if outcome == file_storage::storage::index_db::RegisterOne::RejectedMissingBlob {
+            if !outcome.rejected_missing_blob.is_empty() {
                 up_blocks.write(&hash, &up_data).await.unwrap();
                 outcome = up_index
-                    .register_chunk_verified(
-                        ChunkRegistration {
+                    .register_chunks_at_commit(
+                        vec![ChunkRegistration {
                             hash,
                             size_stored: up_data.len() as u64,
                             on_disk_path: up_path,
-                        },
+                        }],
                         {
                             let b = up_blocks.clone();
                             move |p: &str| b.path_exists(p)
@@ -187,7 +187,7 @@ async fn race_gc_upload_x100() {
         // which the second attempt covers. So after self-heal it must be
         // Fresh or DedupHit.
         assert!(
-            outcome != file_storage::storage::index_db::RegisterOne::RejectedMissingBlob,
+            outcome.rejected_missing_blob.is_empty(),
             "iteration {i}: registration never succeeded — pipeline would 409"
         );
 
@@ -242,12 +242,12 @@ async fn race_orphan_sweep_upload() {
     // Verified registration rejects the missing blob...
     let out = rig
         .index
-        .register_chunk_verified(
-            ChunkRegistration {
+        .register_chunks_at_commit(
+            vec![ChunkRegistration {
                 hash,
                 size_stored: data.len() as u64,
                 on_disk_path: rig.blocks.relative_path(&hash),
-            },
+            }],
             {
                 let b = rig.blocks.clone();
                 move |p: &str| b.path_exists(p)
@@ -256,8 +256,8 @@ async fn race_orphan_sweep_upload() {
         .await
         .unwrap();
     assert_eq!(
-        out,
-        file_storage::storage::index_db::RegisterOne::RejectedMissingBlob,
+        out.rejected_missing_blob.len(),
+        1,
         "missing blob must be rejected (no dangling row)"
     );
 
@@ -265,12 +265,12 @@ async fn race_orphan_sweep_upload() {
     rig.blocks.write(&hash, &data).await.unwrap();
     let out = rig
         .index
-        .register_chunk_verified(
-            ChunkRegistration {
+        .register_chunks_at_commit(
+            vec![ChunkRegistration {
                 hash,
                 size_stored: data.len() as u64,
                 on_disk_path: rig.blocks.relative_path(&hash),
-            },
+            }],
             {
                 let b = rig.blocks.clone();
                 move |p: &str| b.path_exists(p)
@@ -278,7 +278,7 @@ async fn race_orphan_sweep_upload() {
         )
         .await
         .unwrap();
-    assert_eq!(out, file_storage::storage::index_db::RegisterOne::Fresh);
+    assert_eq!(out.fresh.len(), 1, "fresh registration after heal");
 
     // ...and the committed manifest reads back correctly.
     let m = manifest_of("healed.bin", hash, data.len() as u64);
@@ -301,7 +301,7 @@ async fn gc_does_not_delete_reregistered_chunk() {
         on_disk_path: rig.blocks.relative_path(&hash),
     };
     rig.index
-        .register_chunk_verified(reg, {
+        .register_chunks_at_commit(vec![reg], {
             let b = rig.blocks.clone();
             move |p: &str| b.path_exists(p)
         })
@@ -322,12 +322,12 @@ async fn gc_does_not_delete_reregistered_chunk() {
     // victim list built BEFORE the re-registration.
     rig.blocks.write(&hash, &data).await.unwrap();
     rig.index
-        .register_chunk_verified(
-            ChunkRegistration {
+        .register_chunks_at_commit(
+            vec![ChunkRegistration {
                 hash,
                 size_stored: data.len() as u64,
                 on_disk_path: rig.blocks.relative_path(&hash),
-            },
+            }],
             {
                 let b = rig.blocks.clone();
                 move |p: &str| b.path_exists(p)
@@ -386,12 +386,12 @@ async fn v6_07_reassert_restores_blob_after_racing_gc_delete() {
     rig.blocks.write(&hash, &data).await.unwrap();
     let out = rig
         .index
-        .register_chunk_verified(
-            file_storage::storage::index_db::ChunkRegistration {
+        .register_chunks_at_commit(
+            vec![file_storage::storage::index_db::ChunkRegistration {
                 hash,
                 size_stored: data.len() as u64,
                 on_disk_path: path.clone(),
-            },
+            }],
             {
                 let b = rig.blocks.clone();
                 move |p: &str| b.path_exists(p)
@@ -399,7 +399,7 @@ async fn v6_07_reassert_restores_blob_after_racing_gc_delete() {
         )
         .await
         .unwrap();
-    assert_eq!(out, file_storage::storage::index_db::RegisterOne::Fresh);
+    assert_eq!(out.fresh.len(), 1, "fresh registration after heal");
 
     // The racing GC: its snapshot pre-dated the commit, so its re-check
     // sees nothing, and its claim + delete is FINAL by the time the

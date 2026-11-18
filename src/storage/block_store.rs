@@ -83,8 +83,10 @@ impl BlockStore {
             f.sync_all().await.map_err(dbe)?;
         }
         tokio::fs::rename(&tmp, &path).await.map_err(dbe)?;
+        crate::failpoint!("upload-after-rename");
         // fsync the directory so the rename survives crashes.
         fsync_dir(&dir).await?;
+        crate::failpoint!("upload-after-dir-fsync");
         Ok(true)
     }
 
@@ -314,9 +316,18 @@ impl BlockStore {
 /// rename itself is still atomic within the OS page cache and the fsync is
 /// skipped (M-13 portability discipline: explicit, logged once, never a
 /// silent error).
+/// Observability counter for the durability discriminator (V8 C-3 /
+/// V8-REG-01): the unix fsync test asserts this INCREMENTS across a
+/// `BlockStore::write`, so removing the fsync call freezes the counter and
+/// turns the test red - the automated form of the V8 §4.1 scratch-branch
+/// proof. Production behavior is unchanged (the increment precedes the
+/// real sync_all; the fsync itself is never gated by tests).
+pub static DIR_FSYNC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 async fn fsync_dir(dir: &Path) -> Result<(), StorageError> {
     #[cfg(unix)]
     {
+        DIR_FSYNC_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let d = tokio::fs::File::open(dir).await.map_err(dbe)?;
         d.sync_all().await.map_err(dbe)?;
     }
@@ -338,6 +349,7 @@ async fn fsync_dir(dir: &Path) -> Result<(), StorageError> {
 fn fsync_dir_blocking(dir: &Path) -> Result<(), StorageError> {
     #[cfg(unix)]
     {
+        DIR_FSYNC_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let d = std::fs::File::open(dir).map_err(dbe)?;
         d.sync_all().map_err(dbe)?;
     }
@@ -423,5 +435,33 @@ mod tests {
         bs.write(&h, b"z").await.unwrap();
         let hex = hex::encode(h);
         assert!(dir.path().join(format!("{hex}.bin")).exists());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod fsync_discriminator_tests {
+    /// V8 C-3 (V8-REG-01): the dir-fsync durability sequence is now
+    /// DISCRIMINATED. If anyone removes the fsync call from fsync_dir /
+    /// fsync_dir_blocking, this counter freezes and the test goes red —
+    /// the automated equivalent of the V8 scratch-branch proof (which
+    /// showed 265/0 green with the fsync deleted).
+    #[tokio::test]
+    async fn dir_fsync_sequence_runs_per_write() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let bs = BlockStore::new(dir.path(), 2);
+        let before = super::DIR_FSYNC_CALLS.load(Ordering::Relaxed);
+        bs.write(&[9u8; 32], b"discriminator").await.unwrap();
+        let after_async = super::DIR_FSYNC_CALLS.load(Ordering::Relaxed);
+        assert!(
+            after_async > before,
+            "dir-fsync counter must increment per async write (V8 C-3): {before} -> {after_async}"
+        );
+        bs.write_blocking(&[10u8; 32], b"discriminator-b").unwrap();
+        let after_blocking = super::DIR_FSYNC_CALLS.load(Ordering::Relaxed);
+        assert!(
+            after_blocking > after_async,
+            "dir-fsync counter must increment per blocking write (V8 C-3): {after_async} -> {after_blocking}"
+        );
     }
 }

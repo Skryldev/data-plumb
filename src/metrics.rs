@@ -63,6 +63,9 @@ pub const M_REPAIR_CIPHERTEXT: &str = "file_storage_repair_ciphertext_only_total
 pub const M_REPAIR_KEY_MISSING: &str = "file_storage_repair_key_missing_total";
 pub const M_BOOT_QUARANTINE_SWEPT: &str = "file_storage_startup_quarantine_swept";
 pub const M_GC_RECONCILE_LEAKED: &str = "file_storage_gc_reconcile_leaked_total";
+pub const M_WAL_FSYNC: &str = "file_storage_wal_fsync_total";
+pub const M_WAL_RECOVERED_TAIL: &str = "file_storage_wal_recovered_tail_total";
+pub const M_QUOTA_REJECT: &str = "file_storage_quota_reject_total";
 
 /// Records an upload completion.
 pub fn record_upload(dur_secs: f64, status: &'static str, bytes: u64, dedup_bytes: u64) {
@@ -193,6 +196,25 @@ pub const M_LOGIN_THROTTLE_LOCKED: &str = "file_storage_login_throttle_locked_to
 /// bounded by design; the identity lives in the audit row).
 pub fn record_login_throttled(dimension: &str) {
     metrics::counter!(M_LOGIN_THROTTLE_LOCKED, "dimension" => dimension.to_owned()).increment(1);
+}
+
+/// WAL fsyncs (group-commit batches share one fsync — wal.md §4).
+pub fn record_wal_fsync(n: u64) {
+    if n > 0 {
+        metrics::counter!(M_WAL_FSYNC).increment(n);
+    }
+}
+
+/// WAL tail-corruption recovery events (wal.md §5).
+pub fn record_wal_recovered_tail(n: u64) {
+    if n > 0 {
+        metrics::counter!(M_WAL_RECOVERED_TAIL).increment(n);
+    }
+}
+
+/// I-2: commit-time quota re-check rejections.
+pub fn record_quota_reject() {
+    metrics::counter!(M_QUOTA_REJECT).increment(1);
 }
 
 /// C-03: counts chunk registrations rejected because a racing GC/purge

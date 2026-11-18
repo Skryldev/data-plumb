@@ -53,8 +53,6 @@ struct StoredChunk {
     encrypted: bool,
     size_original: u64,
     size_stored: u64,
-    /// C-03/H-01: whether the fused registration dedup-hit.
-    dedup_hit: bool,
 }
 
 #[derive(Clone)]
@@ -71,6 +69,8 @@ pub struct UploadPipeline {
     chunking: crate::config::ChunkingConfig,
     max_size: u64,
     sync_replication: bool,
+    dedup_scope: crate::config::DedupScope,
+    max_quota_bytes: Option<u64>,
 }
 
 /// Result of a completed upload.
@@ -108,6 +108,8 @@ impl UploadPipeline {
             chunking: cfg.chunking.clone(),
             max_size: cfg.limits.max_file_size,
             sync_replication,
+            dedup_scope: cfg.dedup.scope,
+            max_quota_bytes: cfg.limits.max_quota_bytes,
         }
     }
 
@@ -136,6 +138,7 @@ impl UploadPipeline {
         let size_original = Arc::new(AtomicU64::new(0));
         let idx_counter = Arc::new(AtomicUsize::new(0));
         let encryptor = self.encryptor.clone();
+        let dedup_scope = self.dedup_scope;
         let tenant = tenant_id;
         let hasher_captured = file_hasher.clone();
         let size_captured = size_original.clone();
@@ -158,6 +161,7 @@ impl UploadPipeline {
             let compressor = self.compressor.clone();
             let blocks = self.blocks.clone();
             let encryptor = encryptor.clone();
+            let dedup_scope = dedup_scope;
             let file_hasher = hasher_captured.clone();
             let size_original = size_captured.clone();
             let idx_counter = idx_counter.clone();
@@ -179,9 +183,12 @@ impl UploadPipeline {
                 file_hasher.lock().expect("hasher lock").update(&data);
                 size_original.fetch_add(data.len() as u64, Ordering::Relaxed);
                 let plain_hash = hash_bytes(&data);
+                // M-16: BOTH modes derive the block key through the
+                // configured dedup scope (tenant default — the plaintext
+                // cross-tenant oracle is closed by construction).
                 let storage_hash = match &encryptor {
                     Some(_) => Encryptor::storage_key(&tenant, &plain_hash),
-                    None => plain_hash,
+                    None => Encryptor::scoped_key(dedup_scope, &tenant, &plain_hash),
                 };
                 let raw = RawChunk {
                     idx: idx_counter.fetch_add(1, Ordering::Relaxed),
@@ -225,13 +232,60 @@ impl UploadPipeline {
 
         let original_hash = file_hasher.lock().expect("hasher lock").finalize();
 
+        // V6-10 (PG-1R I-4): ONE batch registration at commit — the only
+        // chunk-registration write path. The batch presence-checks every
+        // blob inside the txn; a race-lost blob rejects the upload cleanly
+        // (per-chunk bytes are gone by commit time — the client retry
+        // re-uploads; the blob write already survived the C-03 in-scope
+        // re-assert above).
+        let register_items: Vec<crate::storage::index_db::ChunkRegistration> = stored
+            .values()
+            .map(|sc| crate::storage::index_db::ChunkRegistration {
+                hash: sc.storage_hash,
+                size_stored: sc.size_stored,
+                on_disk_path: self.blocks.relative_path(&sc.storage_hash),
+            })
+            .collect();
+        let blocks_for_reg = self.blocks.clone();
+        let report = if register_items.is_empty() {
+            crate::storage::index_db::RegisterReport::default()
+        } else {
+            match self
+                .index
+                .register_chunks_at_commit(register_items, move |p: &str| {
+                    blocks_for_reg.path_exists(p)
+                })
+                .await
+            {
+                Ok(r) if r.rejected_missing_blob.is_empty() => r,
+                Ok(r) => {
+                    for h in &r.rejected_missing_blob {
+                        tracing::error!(
+                            hash = %hex::encode(h),
+                            "C-03: blob missing at commit — aborting upload (client may retry)"
+                        );
+                    }
+                    return Err(StorageError::Conflict(format!(
+                        "chunk blob(s) missing at commit registration ({} rejected) — client may retry",
+                        r.rejected_missing_blob.len()
+                    )));
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        let dedup_hits: std::collections::HashSet<[u8; 32]> =
+            report.dedup_hit.iter().copied().collect();
+
         // Assemble ordered chunk refs from the retained metadata ONLY
         // (H-01: no blob bytes survive their chunk's processing stage).
-        let dedup_chunks = stored.values().filter(|sc| sc.dedup_hit).count();
+        let dedup_chunks = stored
+            .values()
+            .filter(|sc| dedup_hits.contains(&sc.storage_hash))
+            .count();
         let new_chunks = stored.len() - dedup_chunks;
         let dedup_bytes: u64 = stored
             .values()
-            .filter(|sc| sc.dedup_hit)
+            .filter(|sc| dedup_hits.contains(&sc.storage_hash))
             .map(|sc| sc.size_stored)
             .sum();
         let chunks: Vec<ChunkRef> = stored
@@ -271,7 +325,21 @@ impl UploadPipeline {
             version: 1,
         };
         manifest.recompute_stored_size();
-        self.index.put_manifest(&manifest).await?;
+        // I-2: the quota re-check rides the same redb txn as the manifest
+        // write (storage-format-v2.md §5). Admission-gate reserve is the
+        // fast path; this is the atomic enforcement point.
+        match self
+            .index
+            .put_manifest_checked(&manifest, self.max_quota_bytes)
+            .await
+        {
+            Ok(()) => {}
+            Err(StorageError::TooLarge(msg)) if msg.contains("quota exceeded") => {
+                crate::metrics::record_quota_reject();
+                return Err(StorageError::TooLarge(msg));
+            }
+            Err(e) => return Err(e),
+        }
 
         // Replication: chunk ops were enqueued per chunk (H-01); the
         // manifest op follows them (queue order preserved), then the
@@ -386,50 +454,18 @@ async fn store_chunk(
     // a crash in between leaves a GC-able orphan, never a dangling ref.
     blocks.write(&raw.storage_hash, &blob).await?;
 
-    // C-03 verified registration (fused single-chunk variant): a blob lost
-    // to a racing GC/purge is rewritten (idempotent CAS) and retried; a
-    // final rejection aborts the upload cleanly (409 / FAILED_PRECONDITION).
+    // V6-10 (PG-1R I-4): registration no longer happens per chunk here —
+    // the batch joins the manifest commit (register_chunks_at_commit,
+    // one redb txn). The V6-07 post-write presence re-assert stays (the
+    // blob bytes are in scope HERE, so a race-lost blob is rewritten now);
+    // the commit-time batch re-checks presence again (V8 §4.3 coverage).
     let path = blocks.relative_path(&raw.storage_hash);
-    let mut outcome = index
-        .register_chunk_verified(
-            crate::storage::index_db::ChunkRegistration {
-                hash: raw.storage_hash,
-                size_stored: blob.len() as u64,
-                on_disk_path: path.clone(),
-            },
-            {
-                let b = blocks.clone();
-                move |p: &str| b.path_exists(p)
-            },
-        )
-        .await?;
-    for attempt in 0..2u32 {
-        if outcome != crate::storage::index_db::RegisterOne::RejectedMissingBlob {
-            break;
-        }
+    if !blocks.path_exists(&path) {
         metrics::record_register_race(1);
-        tracing::warn!(attempt, "C-03: blob lost to a racing GC/purge; rewriting");
+        tracing::warn!("C-03: blob lost to a racing GC/purge; rewriting");
         blocks.write(&raw.storage_hash, &blob).await?;
-        outcome = index
-            .register_chunk_verified(
-                crate::storage::index_db::ChunkRegistration {
-                    hash: raw.storage_hash,
-                    size_stored: blob.len() as u64,
-                    on_disk_path: path.clone(),
-                },
-                {
-                    let b = blocks.clone();
-                    move |p: &str| b.path_exists(p)
-                },
-            )
-            .await?;
     }
-    if outcome == crate::storage::index_db::RegisterOne::RejectedMissingBlob {
-        return Err(StorageError::Conflict(
-            "chunk blob repeatedly lost to GC during upload; aborting — client may retry"
-                .to_string(),
-        ));
-    }
+    let _ = &index; // registration moved to the commit batch (V6-10)
 
     // V6-07: the registration committed — re-assert the blob (closes the
     // claim+delete-after-commit window; see verify_blob_after_register).
@@ -461,6 +497,5 @@ async fn store_chunk(
         encrypted,
         size_original: raw_size_original,
         size_stored,
-        dedup_hit: outcome.is_dedup_hit(),
     })
 }

@@ -8,23 +8,17 @@ use std::time::Instant;
 
 #[test]
 fn c01_boot_refuses_default_yaml() {
-    // Prefer the release binary (production profile semantics), fall back
-    // to the debug binary — the shipped config fails validation either way.
-    // EXE_SUFFIX keeps the probe portable (".exe" on Windows, "" elsewhere).
-    let suffix = std::env::consts::EXE_SUFFIX;
-    let candidates = [
-        format!("target/release/file-storage{suffix}"),
-        format!("target/debug/file-storage{suffix}"),
-    ];
-    let candidates: &[&str] = &[candidates[0].as_str(), candidates[1].as_str()];
-    let bin = candidates
-        .iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .expect("build the binary first (cargo build)");
+    // Binary discovery: cargo sets CARGO_BIN_EXE_<name> for integration
+    // tests when the package has a bin target — this is the portable,
+    // CI-correct mechanism (a target/release probe fails on CI where the
+    // release profile is never built before `cargo test`).
+    let bin = std::env::var("CARGO_BIN_EXE_file-storage")
+        .expect("CARGO_BIN_EXE_file-storage must be set by cargo test");
+
     let dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
 
     let started = Instant::now();
-    let out = Command::new(bin)
+    let out = Command::new(&bin)
         .args([
             "--config",
             "config/default.yaml",

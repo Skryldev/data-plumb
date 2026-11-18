@@ -81,6 +81,10 @@ argon2 = "0.5"
 aes-gcm = "0.10"
 rand = "0.8"
 dashmap = "5"
+# Cursor encoding for the v2 list endpoints (storage-format-v2.md §4).
+base64 = "0.22"
+# WAL record CRC (wal.md §3).
+crc32c = "0.6"
 
 # Rate limiting
 tower_governor = "0.4"
@@ -134,6 +138,11 @@ protoc-bin-vendored = "3"
 criterion = "0.5"
 rcgen = "0.13"
 proptest = "1.8.0"
+
+[features]
+# Crash-consistency failpoint harness (docs/design/crash-consistency.md).
+# Zero cost in production builds; tests: --features failpoints.
+failpoints = []
 
 [profile.release]
 opt-level = 3

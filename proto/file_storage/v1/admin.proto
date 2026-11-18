@@ -2,6 +2,10 @@ syntax = "proto3";
 
 package file_storage.v1;
 
+option go_package = "github.com/cie-aa/data-plumb/proto/file_storage/v1;file_storagev1";
+option java_package = "com.cieaa.filestorage.v1";
+option csharp_namespace = "CieAa.FileStorage.V1";
+
 import "file_storage/v1/common.proto";
 import "google/protobuf/timestamp.proto";
 

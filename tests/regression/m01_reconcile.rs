@@ -85,12 +85,12 @@ fn manifest_of(name: &str, hash: [u8; 32], size: u64) -> Manifest {
 
 async fn register(rig: &Rig, hash: [u8; 32], size: usize) {
     rig.index
-        .register_chunk_verified(
-            ChunkRegistration {
+        .register_chunks_at_commit(
+            vec![ChunkRegistration {
                 hash,
                 size_stored: size as u64,
                 on_disk_path: rig.blocks.relative_path(&hash),
-            },
+            }],
             {
                 let b = rig.blocks.clone();
                 move |p: &str| b.path_exists(p)

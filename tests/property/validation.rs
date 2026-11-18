@@ -17,6 +17,7 @@ fn limits() -> LimitsConfig {
         max_in_flight_bytes: 1024 * 1024,
         max_concurrent_uploads: 4,
         internal_body: 1024 * 1024 * 8,
+        max_quota_bytes: None,
     }
 }
 
