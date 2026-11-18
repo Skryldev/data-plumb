@@ -6,6 +6,15 @@ lint:
     - STANDARD
   except:
     - PACKAGE_VERSION_SUFFIX
+    # CF-2 (PG-1R2FIX): legacy v1 API uses shared message types and
+    # non-standard RPC naming; renaming the generated types is a breaking
+    # client change. Excluded pending v2 API redesign (PG-N). The
+    # PG-1R F2 fix added three of these four rules but missed
+    # RPC_REQUEST_STANDARD_NAME; the rewritten history dropped the rest.
+    - RPC_RESPONSE_STANDARD_NAME
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_REQUEST_RESPONSE_UNIQUE
+    - ENUM_VALUE_PREFIX
   ignore_only:
     ENUM_ZERO_VALUE_SUFFIX:
       - proto/file_storage/v1/admin.proto
